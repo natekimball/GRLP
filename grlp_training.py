@@ -31,6 +31,8 @@ EPS_CLIP_LOW, EPS_CLIP_HIGH = 0.1, 0.1 # PPO clipping
 NUM_EPOCHS = 1
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
+# TODO: add in <think> and </think> tokens (use </think> as stop condition for generation)
+
 # -----------------------------
 # Helpers
 # -----------------------------
@@ -165,6 +167,7 @@ for epoch in range(NUM_EPOCHS):
             for gidx in range(G):
                 # Simple generation: supply prefix, generate short CoT (max_new_tokens ~ 32)
                 # We generate only the CoT tokens, not the gold next tokens.
+                # TODO: add <think> token after prefix
                 in_ids = prefix.clone()
                 # To call generate with prefix as tensors we need to decode + generate, or use generate with input_ids directly:
                 # use do_sample True and some sampling config
@@ -265,9 +268,6 @@ for epoch in range(NUM_EPOCHS):
         with torch.no_grad():
             for p_ema, p in zip(ema_model.parameters(), model.parameters()):
                 p_ema.data.mul_(TAU).add_(p.data, alpha=1.0 - TAU)
-
-        # clean up theta_old to free memory
-        del theta_old_model
 
         global_step += 1
         loop.set_postfix({"loss": float(total_loss.detach().cpu()), "step": global_step})

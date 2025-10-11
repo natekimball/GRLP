@@ -17,8 +17,9 @@ from tqdm import tqdm
 # Config
 # -----------------------------
 MODEL_NAME = "Qwen/Qwen3-0.6B-Base"   # change to local checkpoint if needed
-DATASET = "allenai/dolma"
-SUBSET_PERCENT = "train[:0.1%]"       # small subset for debug; remove for real runs
+# DATASET = "allenai/dolma"
+DATASET = "HuggingFaceFW/fineweb"
+SPLIT = "train"       # small subset for debug; remove for real runs
 MAX_SEQ_LEN = 2048
 HORIZON = 32                          # reward horizon T (small for debug; paper uses long)
 G = 4                                  # number of rollouts per context
@@ -91,21 +92,31 @@ def make_prefix_and_gold_from_full_input(input_ids, t):
 # Load model, tokenizer, dataset
 # -----------------------------
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
+# Set pad_token to eos_token to avoid warnings
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
 model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, trust_remote_code=True).to(DEVICE)
 ema_model = copy.deepcopy(model).to(DEVICE)
 for p in ema_model.parameters():
     p.requires_grad_(False)
 
+# Reusable snapshot for behavior policy; avoid reallocating every step
+theta_old_model = copy.deepcopy(model).to(DEVICE)
+theta_old_model.eval()
+for p in theta_old_model.parameters():
+    p.requires_grad_(False)
+
 optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
 
 # Load a small subset for debugging. For full experiments, remove slicing.
-ds = load_dataset(DATASET, SUBSET_PERCENT)
+ds = load_dataset(DATASET, split=SPLIT, streaming=True)
 def tokenize_batch(examples):
     # assume examples["text"] exists; truncate to MAX_SEQ_LEN
     out = tokenizer(examples["text"], truncation=True, max_length=MAX_SEQ_LEN, return_tensors=None)
     return out
 ds = ds.map(lambda ex: {"input_ids": tokenizer(ex["text"], truncation=True, max_length=MAX_SEQ_LEN)["input_ids"]})
-loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=lambda x: x)
+# loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=lambda x: x)
+loader = DataLoader(ds, batch_size=BATCH_SIZE, collate_fn=lambda x: x)
 
 # -----------------------------
 # Training loop
@@ -126,9 +137,9 @@ for epoch in range(NUM_EPOCHS):
             continue
 
         # Snapshot theta_old for sampling (behavior policy)
-        theta_old_model = copy.deepcopy(model).eval().to(DEVICE)
-        for p in theta_old_model.parameters():
-            p.requires_grad_(False)
+        with torch.no_grad():
+            theta_old_model.load_state_dict(model.state_dict())
+        theta_old_model.eval()
 
         # For each selected position t, compute G rollouts and returns; then accumulate surrogate losses
         surrogate_losses = []
@@ -157,9 +168,19 @@ for epoch in range(NUM_EPOCHS):
                 in_ids = prefix.clone()
                 # To call generate with prefix as tensors we need to decode + generate, or use generate with input_ids directly:
                 # use do_sample True and some sampling config
-                generated = theta_old_model.generate(in_ids, max_new_tokens=32, do_sample=True, top_p=0.95, eos_token_id=tokenizer.eos_token_id)
+                generated = theta_old_model.generate(
+                    in_ids, 
+                    attention_mask=torch.ones_like(in_ids),
+                    max_new_tokens=32, 
+                    do_sample=True, 
+                    top_p=0.95, 
+                    eos_token_id=tokenizer.eos_token_id,
+                    pad_token_id=tokenizer.pad_token_id,
+                )
                 # generated contains prefix + cot + maybe EOS; remove the prefix part to get only cot tokens
                 cot_tokens = generated[:, P:]  # shape (1, C)
+                if cot_tokens.size(1) <= 1:
+                    continue
                 # remove trailing eos if present
                 # (keep as-is; the logprob computation will handle exact tokens)
                 rollouts_ct.append(cot_tokens)
@@ -178,7 +199,7 @@ for epoch in range(NUM_EPOCHS):
             returns = []  # discounted returns R(c_t) for each rollout
             per_rollout_thought_logprobs_new = []  # list of per-token logp for thought tokens under current model
             per_rollout_thought_tokens = []        # to compute policy loss
-            for i in range(G):
+            for i in range(len(rollouts_ct)):
                 c_tokens = rollouts_ct[i]         # shape (1, C)
                 C = c_tokens.size(1)
                 # Build input: prefix + cot_tokens + gold_window
@@ -199,9 +220,9 @@ for epoch in range(NUM_EPOCHS):
                 # compute per-token logprobs of the thought tokens under current model (for policy)
                 # we'll compute the new-model per-token logprobs on the thought tokens conditioned on prefix
                 inp_for_cot_new = torch.cat([prefix, c_tokens], dim=1)  # (1, P+C)
-                with torch.no_grad():
-                    targets_cot = inp_for_cot_new[:, P:]  # (1, C)
-                    per_token_logp_new = compute_teacher_forced_logprobs(model, inp_for_cot_new, targets_cot)  # (C,)
+                # Remove torch.no_grad() here since we need gradients for the policy loss
+                targets_cot = inp_for_cot_new[:, P:]  # (1, C)
+                per_token_logp_new = compute_teacher_forced_logprobs(model, inp_for_cot_new, targets_cot)  # (C,)
                 per_rollout_thought_logprobs_new.append(per_token_logp_new)  # (C,)
                 per_rollout_thought_tokens.append(c_tokens)
 

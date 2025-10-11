@@ -31,8 +31,6 @@ EPS_CLIP_LOW, EPS_CLIP_HIGH = 0.1, 0.1 # PPO clipping
 NUM_EPOCHS = 1
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# TODO: add in <think> and </think> tokens (use </think> as stop condition for generation)
-
 # -----------------------------
 # Helpers
 # -----------------------------
@@ -97,6 +95,11 @@ tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
 # Set pad_token to eos_token to avoid warnings
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
+# tokenizer.add_special_tokens({"additional_special_tokens": ["<think>", "</think>"]})
+start_thought_id = tokenizer("<think>", return_tensors="pt").input_ids.to(DEVICE)
+end_thought_id = tokenizer("</think>", return_tensors="pt").input_ids.to(DEVICE)
+
+
 model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, trust_remote_code=True).to(DEVICE)
 ema_model = copy.deepcopy(model).to(DEVICE)
 for p in ema_model.parameters():
@@ -154,6 +157,7 @@ for epoch in range(NUM_EPOCHS):
             with torch.no_grad():
                 # EMA input: prefix + gold_window
                 ema_input = torch.cat([prefix, gold_window], dim=1)  # (1, P+H)
+                # ema_input = full_input_ids[:, P+H_current]
                 # compute per-token logprobs for the gold_window under EMA
                 ema_per_token_logp = compute_teacher_forced_logprobs(ema_model, ema_input, gold_window)  # (H,)
                 # shape already (H,) representing log p(x_{t+k} | x_{<t+k}) under EMA
@@ -167,8 +171,7 @@ for epoch in range(NUM_EPOCHS):
             for gidx in range(G):
                 # Simple generation: supply prefix, generate short CoT (max_new_tokens ~ 32)
                 # We generate only the CoT tokens, not the gold next tokens.
-                # TODO: add <think> token after prefix
-                in_ids = prefix.clone()
+                in_ids = torch.cat([prefix, start_thought_id], dim=1)  # (1, P+1)
                 # To call generate with prefix as tensors we need to decode + generate, or use generate with input_ids directly:
                 # use do_sample True and some sampling config
                 generated = theta_old_model.generate(
@@ -177,11 +180,12 @@ for epoch in range(NUM_EPOCHS):
                     max_new_tokens=32, 
                     do_sample=True, 
                     top_p=0.95, 
-                    eos_token_id=tokenizer.eos_token_id,
+                    eos_token_id=[tokenizer.eos_token_id, end_thought_id.item()],
                     pad_token_id=tokenizer.pad_token_id,
                 )
                 # generated contains prefix + cot + maybe EOS; remove the prefix part to get only cot tokens
                 cot_tokens = generated[:, P:]  # shape (1, C)
+                assert generated[0,0] == start_thought_id.item(), "Generation should start with <think> token"
                 if cot_tokens.size(1) <= 1:
                     continue
                 # remove trailing eos if present
@@ -191,17 +195,14 @@ for epoch in range(NUM_EPOCHS):
                 # compute per-token logprob of cot_tokens under theta_old (behavior). We'll need these to form log pi_old per token.
                 # For that, compute logits of theta_old over cot_tokens autoregressively conditioned on prefix.
                 with torch.no_grad():
-                    inp_for_cot = torch.cat([prefix, cot_tokens], dim=1)  # (1, P+C)
                     # we want the logprob of each token in cot_tokens (teacher forcing style)
-                    targets = inp_for_cot[:, P:]  # cot tokens themselves
                     # logits where position j predicts next token j+1; probabilities for cot token u are at logits indices P+u-1
-                    per_token_logp_old = compute_teacher_forced_logprobs(theta_old_model, inp_for_cot, targets)  # (C,)
+                    per_token_logp_old = compute_teacher_forced_logprobs(theta_old_model, generated, cot_tokens)  # (C,)
                     rollouts_logprob_old_tokens.append(per_token_logp_old.detach())
 
             # Now for each rollout evaluate the reasoned per-token log-probs under the current model (p_theta)
             returns = []  # discounted returns R(c_t) for each rollout
             per_rollout_thought_logprobs_new = []  # list of per-token logp for thought tokens under current model
-            per_rollout_thought_tokens = []        # to compute policy loss
             for i in range(len(rollouts_ct)):
                 c_tokens = rollouts_ct[i]         # shape (1, C)
                 C = c_tokens.size(1)
@@ -227,7 +228,6 @@ for epoch in range(NUM_EPOCHS):
                 targets_cot = inp_for_cot_new[:, P:]  # (1, C)
                 per_token_logp_new = compute_teacher_forced_logprobs(model, inp_for_cot_new, targets_cot)  # (C,)
                 per_rollout_thought_logprobs_new.append(per_token_logp_new)  # (C,)
-                per_rollout_thought_tokens.append(c_tokens)
 
             # Convert returns to tensor and compute group-relative advantages (Eq.7)
             returns_tensor = torch.stack(returns)  # (G,)

@@ -153,7 +153,7 @@ for epoch in range(NUM_EPOCHS):
             # compute s_ema per token under EMA model (no-think baseline)
             with torch.no_grad():
                 # EMA input: prefix + gold_window
-                ema_input = full_input_ids[:, P+H_current] # (1, P+H)
+                ema_input = full_input_ids[:, :P+H_current] # (1, P+H)
                 # compute per-token logprobs for the gold_window under EMA
                 s_ema_per_token = compute_teacher_forced_logprobs(ema_model, ema_input, gold_window)  # (H,)
                 # shape already (H,) representing log p(x_{t+k} | x_{<t+k}) under EMA
@@ -181,8 +181,9 @@ for epoch in range(NUM_EPOCHS):
                 )
                 # generated contains prefix + cot + maybe EOS; remove the prefix part to get only cot tokens
                 cot_tokens = generated[:, P:]  # shape (1, C)
-                if cot_tokens.size(1) <= 1:
-                    continue
+                # TODO: add back and change G in normalization later if error experienced
+                # if cot_tokens.size(1) <= 1:
+                #     continue
                 # remove trailing eos if present
                 # (keep as-is; the logprob computation will handle exact tokens)
                 rollouts_ct.append(cot_tokens)
@@ -209,7 +210,7 @@ for epoch in range(NUM_EPOCHS):
                 # ensure ema_per_token_logp has same length H_current
                 r_per_token = s_pred_per_token - s_ema_per_token.to(s_pred_per_token.device)
                 # discounted sum
-                R = torch.tensor([r_i * (GAMMA ** k) for k, r_i in enumerate(r_per_token)], device=r_per_token.device)
+                R = torch.tensor([r_i * (GAMMA ** k) for k, r_i in enumerate(r_per_token)]).sum()
                 returns.append(R.detach())  # treat R as constant (no grad)
 
                 # compute per-token logprobs of the thought tokens under current model (for policy)
@@ -221,7 +222,7 @@ for epoch in range(NUM_EPOCHS):
 
             # Convert returns to tensor and compute group-relative advantages (Eq.7)
             returns_tensor = torch.stack(returns)  # (G,)
-            r_mean = returns_tensor.mean().detach()
+            r_mean = returns_tensor.mean()
             # advantage scaling factor G/(G-1)
             advantages = (G / (G - 1)) * (returns_tensor - r_mean)  # shape (G,)
 

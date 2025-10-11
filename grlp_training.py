@@ -5,7 +5,6 @@ Generalized RLP prototype (discounted-return advantage estimation)
 """
 
 import copy
-import math
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -185,7 +184,7 @@ for epoch in range(NUM_EPOCHS):
                 )
                 # generated contains prefix + cot + maybe EOS; remove the prefix part to get only cot tokens
                 cot_tokens = generated[:, P:]  # shape (1, C)
-                assert generated[0,0] == start_thought_id.item(), "Generation should start with <think> token"
+                assert cot_tokens[0,0] == start_thought_id.item(), f"COT should start with <think> token, instead of {cot_tokens[0,0]}"
                 if cot_tokens.size(1) <= 1:
                     continue
                 # remove trailing eos if present

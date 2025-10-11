@@ -118,7 +118,7 @@ def tokenize_batch(examples):
     out = tokenizer(examples["text"], truncation=True, max_length=MAX_SEQ_LEN, return_tensors=None)
     return out
 ds = ds.map(lambda ex: {"input_ids": tokenizer(ex["text"], truncation=True, max_length=MAX_SEQ_LEN)["input_ids"]})
-loader = DataLoader(ds, batch_size=BATCH_SIZE) # no shuffle for streaming dataset
+loader = DataLoader(ds, batch_size=BATCH_SIZE, collate_fn=lambda x: x) # no shuffle for streaming dataset
 
 # -----------------------------
 # Training loop

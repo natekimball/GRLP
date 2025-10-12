@@ -9,8 +9,9 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from datasets import load_dataset
+from datasets import load_dataset, Dataset
 from tqdm import tqdm
+import os
 
 # -----------------------------
 # Config
@@ -29,6 +30,9 @@ TAU = 0.999                            # EMA decay
 EPS_CLIP_LOW, EPS_CLIP_HIGH = 0.1, 0.1 # PPO clipping
 NUM_EPOCHS = 1
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+# N_data = 10_000
+N_data = 100
+dataset_dir = None
 
 # -----------------------------
 # Helpers
@@ -111,14 +115,21 @@ for p in theta_old_model.parameters():
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
 
-# Load a small subset for debugging. For full experiments, remove slicing.
-ds = load_dataset(DATASET, split=SPLIT, streaming=True)
-def tokenize_batch(examples):
-    # assume examples["text"] exists; truncate to MAX_SEQ_LEN
-    out = tokenizer(examples["text"], truncation=True, max_length=MAX_SEQ_LEN, return_tensors=None)
-    return out
-ds = ds.map(lambda ex: {"input_ids": tokenizer(ex["text"], truncation=True, max_length=MAX_SEQ_LEN)["input_ids"]})
-loader = DataLoader(ds, batch_size=BATCH_SIZE, collate_fn=lambda x: x) # no shuffle for streaming dataset
+cached_subset_dir = f"data/{DATASET.split('/')[-1]}-{N_data}"
+if os.path.exists(cached_subset_dir):
+    ds = Dataset.load_from_disk(cached_subset_dir)
+else:
+    # Load a small subset for debugging. For full experiments, remove slicing.
+    ds = load_dataset(DATASET, split=SPLIT, streaming=True).take(N_data)
+    def tokenize_batch(examples):
+        # assume examples["text"] exists; truncate to MAX_SEQ_LEN
+        out = tokenizer(examples["text"], truncation=True, max_length=MAX_SEQ_LEN, return_tensors=None)
+        return out
+    ds = ds.map(lambda ex: {"input_ids": tokenizer(ex["text"], truncation=True, max_length=MAX_SEQ_LEN)["input_ids"]})
+    ds = Dataset.from_list(list(ds))
+    ds.save_to_disk(cached_subset_dir)
+    
+loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=lambda x: x) # no shuffle for streaming dataset
 
 # -----------------------------
 # Training loop

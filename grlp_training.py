@@ -38,6 +38,7 @@ TAU = 0.999                            # EMA decay
 EPS_CLIP_LOW, EPS_CLIP_HIGH = 0.1, 0.1 # PPO clipping
 NUM_EPOCHS = 1
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+LOGPROB_CHUNK_SIZE = 2                 # split large log-prob batches to save memory
 # N_data = 10_000
 N_data = 100
 dataset_dir = None
@@ -69,22 +70,29 @@ def batched_token_logprobs(
     if not sequences:
         return []
 
-    padded, attention_mask, lengths = pad_sequences_1d(sequences, pad_token_id)
-    with torch.set_grad_enabled(requires_grad):
-        outputs = model(input_ids=padded, attention_mask=attention_mask)
-        logits = outputs.logits[:, :-1, :]
-        log_probs = F.log_softmax(logits, dim=-1)
-        targets = padded[:, 1:]
-        gathered = log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
-
     results = []
-    for idx, (prefix_len, target_len) in enumerate(zip(prefix_lengths, target_lengths)):
-        if target_len == 0:
-            results.append(gathered.new_zeros((0,), requires_grad=requires_grad))
-            continue
-        start = prefix_len - 1
-        end = start + target_len
-        results.append(gathered[idx, start:end])
+    for start_idx in range(0, len(sequences), LOGPROB_CHUNK_SIZE):
+        end_idx = start_idx + LOGPROB_CHUNK_SIZE
+        seq_chunk = sequences[start_idx:end_idx]
+        prefix_chunk = prefix_lengths[start_idx:end_idx]
+        target_chunk = target_lengths[start_idx:end_idx]
+
+        padded, attention_mask, _ = pad_sequences_1d(seq_chunk, pad_token_id)
+        with torch.set_grad_enabled(requires_grad):
+            outputs = model(input_ids=padded, attention_mask=attention_mask)
+            logits = outputs.logits[:, :-1, :]
+            log_probs = F.log_softmax(logits, dim=-1)
+            targets = padded[:, 1:]
+            gathered = log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+
+        for local_idx, (prefix_len, target_len) in enumerate(zip(prefix_chunk, target_chunk)):
+            if target_len == 0:
+                empty = torch.zeros(0, device=gathered.device, dtype=gathered.dtype, requires_grad=requires_grad)
+                results.append(empty)
+                continue
+            start_pos = prefix_len - 1
+            end_pos = start_pos + target_len
+            results.append(gathered[local_idx, start_pos:end_pos])
     return results
 
 

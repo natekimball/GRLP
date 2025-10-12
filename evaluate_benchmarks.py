@@ -30,7 +30,7 @@ import argparse
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, List, Sequence, Tuple
+from typing import Any, Iterable, List, Sequence, Tuple, Optional
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -65,7 +65,6 @@ class RLPConfig:
     temperature: float = 0.7
     top_p: float = 0.9
     max_generation_tokens: int = 256
-    do_sample: bool = False
 
 
 class RLPReasoningLM(LM):
@@ -142,22 +141,14 @@ class RLPReasoningLM(LM):
         # Prefix shape: (1, L)
         input_with_marker = torch.cat([prefix, self._start_think_tensor], dim=1)
         with torch.no_grad():
-            generation_kwargs = {
-                "max_new_tokens": self._cfg.thought_max_tokens,
-                "do_sample": self._cfg.do_sample,
-                "pad_token_id": self.tokenizer.pad_token_id,
-                "eos_token_id": [self._end_think_id, self.tokenizer.eos_token_id],
-            }
-            if self._cfg.do_sample:
-                generation_kwargs.update(
-                    {
-                        "temperature": self._cfg.temperature,
-                        "top_p": self._cfg.top_p,
-                    }
-                )
             generated = self.model.generate(
                 input_with_marker,
-                **generation_kwargs,
+                max_new_tokens=self._cfg.thought_max_tokens,
+                do_sample=True,
+                temperature=self._cfg.temperature,
+                top_p=self._cfg.top_p,
+                pad_token_id=self.tokenizer.pad_token_id,
+                eos_token_id=[self._end_think_id, self.tokenizer.eos_token_id],
             )
         thought_tokens = generated[:, input_with_marker.size(1) :]
         if thought_tokens.size(1) == 0:
@@ -299,8 +290,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--fewshot",
-        type=int,
-        default=0,
+        type=Optional[int],
+        default=None,
         help="Number of few-shot examples to use. Set to 0 for zero-shot evaluation.",
     )
     parser.add_argument(

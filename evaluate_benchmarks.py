@@ -36,7 +36,11 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from lm_eval import evaluator
-from lm_eval.models.base import LM
+
+try:
+    from lm_eval.models.base import LM  # Older harness releases
+except ModuleNotFoundError:  # lm-eval-harness >= 0.4.0
+    from lm_eval.api.model import LM
 
 # ---------------------------------------------------------------------------
 # Task configuration

@@ -30,7 +30,7 @@ import argparse
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Sequence, Tuple
+from typing import Any, Iterable, List, Sequence, Tuple
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -48,14 +48,14 @@ except ModuleNotFoundError:  # lm-eval-harness >= 0.4.0
 # Mapping from display name to lm-eval task identifiers.
 # Adjust identifiers if you are using a custom fork of the harness.
 DEFAULT_TASKS = {
-    "AIME25": "aime-2025",
-    "MATH500": "math500",
-    "GSM8K": "gsm8k",
-    "AMC23": "amc23",
-    "Minerva": "minerva_math",
+    # "AIME25": "aime-2025",
+    # "MATH500": "math500",
+    # "GSM8K": "gsm8k",
+    # "AMC23": "amc23",
+    # "Minerva": "minerva_math",
     "MMLU": "mmlu",
-    "MMLU-Pro": "mmlu_pro",
-    "GPQA": "gpqa_diamond",
+    # "MMLU-Pro": "mmlu_pro",
+    # "GPQA": "gpqa_diamond",
 }
 
 
@@ -65,6 +65,7 @@ class RLPConfig:
     temperature: float = 0.7
     top_p: float = 0.9
     max_generation_tokens: int = 256
+    do_sample: bool = False
 
 
 class RLPReasoningLM(LM):
@@ -141,14 +142,22 @@ class RLPReasoningLM(LM):
         # Prefix shape: (1, L)
         input_with_marker = torch.cat([prefix, self._start_think_tensor], dim=1)
         with torch.no_grad():
+            generation_kwargs = {
+                "max_new_tokens": self._cfg.thought_max_tokens,
+                "do_sample": self._cfg.do_sample,
+                "pad_token_id": self.tokenizer.pad_token_id,
+                "eos_token_id": [self._end_think_id, self.tokenizer.eos_token_id],
+            }
+            if self._cfg.do_sample:
+                generation_kwargs.update(
+                    {
+                        "temperature": self._cfg.temperature,
+                        "top_p": self._cfg.top_p,
+                    }
+                )
             generated = self.model.generate(
                 input_with_marker,
-                max_new_tokens=self._cfg.thought_max_tokens,
-                do_sample=True,
-                temperature=self._cfg.temperature,
-                top_p=self._cfg.top_p,
-                pad_token_id=self.tokenizer.pad_token_id,
-                eos_token_id=[self._end_think_id, self.tokenizer.eos_token_id],
+                **generation_kwargs,
             )
         thought_tokens = generated[:, input_with_marker.size(1) :]
         if thought_tokens.size(1) == 0:
@@ -174,9 +183,19 @@ class RLPReasoningLM(LM):
     # ------------------------------------------------------------------
     # LM API implementations
     # ------------------------------------------------------------------
-    def loglikelihood(self, requests: Sequence[Tuple[str, str]]):
+    def _unpack_request(self, request: Any) -> Tuple[str, str]:
+        if isinstance(request, tuple):
+            return request
+        if hasattr(request, "args"):
+            return tuple(request.args)  # type: ignore[misc]
+        if hasattr(request, "arguments"):
+            return tuple(request.arguments)  # type: ignore[misc]
+        raise TypeError(f"Unsupported request type: {type(request)!r}")
+
+    def loglikelihood(self, requests: Sequence[Any]):
         outputs = []
-        for context, continuation in requests:
+        for req in requests:
+            context, continuation = self._unpack_request(req)
             ctx_tokens = self._tokenize(context)
             cont_tokens = self._tokenize(continuation)
 
@@ -202,7 +221,15 @@ class RLPReasoningLM(LM):
     def loglikelihood_rolling(self, requests):
         # Fallback implementation using point-wise loglikelihood.
         outputs = []
-        for (text,) in requests:
+        for req in requests:
+            if isinstance(req, tuple):
+                (text,) = req
+            elif hasattr(req, "args"):
+                (text,) = req.args
+            elif hasattr(req, "arguments"):
+                (text,) = req.arguments
+            else:
+                raise TypeError(f"Unsupported request type: {type(req)!r}")
             tokens = self._tokenize(text)
             prefix = tokens[:, :1]
             rolling = []
@@ -221,7 +248,8 @@ class RLPReasoningLM(LM):
 
     def generate_until(self, requests):
         generations = []
-        for context, until in requests:
+        for req in requests:
+            context, until = self._unpack_request(req)
             prefix = self._tokenize(context)
             generated: List[int] = []
             decoded = ""

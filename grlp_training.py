@@ -14,6 +14,7 @@ from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import Dataset, load_dataset
 from tqdm import tqdm
+import os
 
 # -----------------------------
 # Config
@@ -37,6 +38,9 @@ TAU = 0.999                            # EMA decay
 EPS_CLIP_LOW, EPS_CLIP_HIGH = 0.1, 0.1 # PPO clipping
 NUM_EPOCHS = 1
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+# N_data = 10_000
+N_data = 100
+dataset_dir = None
 
 # -----------------------------
 # Helpers

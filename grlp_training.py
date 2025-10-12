@@ -5,11 +5,14 @@ Generalized RLP prototype (discounted-return advantage estimation)
 """
 
 import copy
+from pathlib import Path
+
 import torch
 import torch.nn.functional as F
+from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from datasets import load_dataset
+from datasets import Dataset, load_dataset
 from tqdm import tqdm
 
 # -----------------------------
@@ -23,7 +26,12 @@ MAX_SEQ_LEN = 2048
 HORIZON = 32                          # reward horizon T (small for debug; paper uses long)
 G = 4                                  # number of rollouts per context
 GAMMA = 0.9                            # discount factor
-BATCH_SIZE = 1                         # token-level RLP is expensive; tune for your memory
+BATCH_SIZE = 4                         # leverage batching for better GPU utilization
+MAX_DATASET_SAMPLES = 10_000           # cap for cached subset
+DATA_CACHE_DIR = Path("data/fineweb-10k-tokenized")
+THOUGHT_MAX_TOKENS = 128
+THOUGHT_TOP_P = 0.95
+THOUGHT_TEMPERATURE = 0.7
 LR = 1e-5
 TAU = 0.999                            # EMA decay
 EPS_CLIP_LOW, EPS_CLIP_HIGH = 0.1, 0.1 # PPO clipping
@@ -33,57 +41,47 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # -----------------------------
 # Helpers
 # -----------------------------
-def gather_token_logprobs_from_logits(logits, target_ids):
-    """
-    logits: (B, S, V)
-    target_ids: (B, S) tokens that the logits are predicting (i.e. next-token targets)
-    returns: per-token log probability shape (B, S)
-    """
-    logprobs = F.log_softmax(logits, dim=-1)
-    # gather the logprob of each target token
-    # target_ids must be long dtype
-    return logprobs.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
+def pad_sequences_1d(sequences, pad_token_id):
+    if not sequences:
+        raise ValueError("pad_sequences_1d received an empty sequence list")
+    device = sequences[0].device
+    lengths = torch.tensor([seq.size(0) for seq in sequences], device=device)
+    max_len = lengths.max().item()
+    padded = torch.full((len(sequences), max_len), pad_token_id, dtype=torch.long, device=device)
+    for idx, seq in enumerate(sequences):
+        padded[idx, : seq.size(0)] = seq
+    attention_mask = (padded != pad_token_id).long()
+    return padded, attention_mask, lengths
 
 
-def compute_teacher_forced_logprobs(model, input_ids, gold_targets):
-    """
-    Compute per-token log-probs under teacher forcing for the sequence:
-      model(input_ids) where input_ids = prefix + optional cot + gold_seq
-    We want the log-probabilities for gold_seq positions (the final len(gold_targets) tokens).
-    Returns: tensor shape (len(gold_targets),) of log-probs (float)
-    """
-    # model returns logits for each position predicting the *next* token
-    outputs = model(input_ids=input_ids).logits  # (1, seq_len, vocab)
-    # the predicted distribution at position j corresponds to next token at j+1.
-    # Suppose input_ids = [prefix_tokens, cot_tokens, gold0, gold1, ...,
-    #                       gold_{H-1}]
-    # We want the model predictions for gold0..gold_{H-1}.
-    seq_len = input_ids.size(1)
-    H = gold_targets.size(1)
-    # number of tokens before gold tokens:
-    prefix_len = seq_len - H
-    # logits indices that predict gold tokens are at positions: prefix_len - 1 ... prefix_len + H - 2
-    # but ensure prefix_len >= 1 (if prefix is empty, typical causal LM has BOS; this script assumes prefix_len >=1)
-    start_idx = prefix_len - 1
-    end_idx = prefix_len + H - 1  # exclusive index in python slicing
-    # select logits corresponding to predictions for gold tokens:
-    logits_for_gold = outputs[:, start_idx:end_idx, :]   # (1, H, V)
-    # targets for those positions are exactly gold_targets (shape (1, H))
-    per_token_logp = gather_token_logprobs_from_logits(logits_for_gold, gold_targets)
-    # shape (1, H) -> squeeze
-    return per_token_logp.squeeze(0)  # (H,)
+def batched_token_logprobs(
+    model,
+    sequences,
+    prefix_lengths,
+    target_lengths,
+    pad_token_id,
+    requires_grad=False,
+):
+    if not sequences:
+        return []
 
+    padded, attention_mask, lengths = pad_sequences_1d(sequences, pad_token_id)
+    with torch.set_grad_enabled(requires_grad):
+        outputs = model(input_ids=padded, attention_mask=attention_mask)
+        logits = outputs.logits[:, :-1, :]
+        log_probs = F.log_softmax(logits, dim=-1)
+        targets = padded[:, 1:]
+        gathered = log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
 
-def make_prefix_and_gold_from_full_input(input_ids, t):
-    """
-    Given full document token sequence (2D tensor), build:
-      prefix = input_ids[:t]
-      gold_window = input_ids[t : t + HORIZON]
-    Returns two 2D tensors with batch dim: (1, prefix_len), (1, H)
-    """
-    prefix = input_ids[:, :t]
-    gold = input_ids[:, t : t + HORIZON]
-    return prefix, gold
+    results = []
+    for idx, (prefix_len, target_len) in enumerate(zip(prefix_lengths, target_lengths)):
+        if target_len == 0:
+            results.append(gathered.new_zeros((0,), requires_grad=requires_grad))
+            continue
+        start = prefix_len - 1
+        end = start + target_len
+        results.append(gathered[idx, start:end])
+    return results
 
 
 # -----------------------------
@@ -93,12 +91,14 @@ tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
 # Set pad_token to eos_token to avoid warnings
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
-# tokenizer.add_special_tokens({"additional_special_tokens": ["<think>", "</think>"]})
-start_thought_id = tokenizer("<think>", return_tensors="pt").input_ids.to(DEVICE)
-end_thought_id = tokenizer("</think>", return_tensors="pt").input_ids.to(DEVICE)
 
+special_tokens = {"additional_special_tokens": ["<think>", "</think>"]}
+added_tokens = tokenizer.add_special_tokens(special_tokens)
 
 model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, trust_remote_code=True).to(DEVICE)
+if added_tokens > 0:
+    model.resize_token_embeddings(len(tokenizer))
+
 ema_model = copy.deepcopy(model).to(DEVICE)
 for p in ema_model.parameters():
     p.requires_grad_(False)
@@ -111,14 +111,45 @@ for p in theta_old_model.parameters():
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
 
-# Load a small subset for debugging. For full experiments, remove slicing.
-ds = load_dataset(DATASET, split=SPLIT, streaming=True)
-def tokenize_batch(examples):
-    # assume examples["text"] exists; truncate to MAX_SEQ_LEN
-    out = tokenizer(examples["text"], truncation=True, max_length=MAX_SEQ_LEN, return_tensors=None)
-    return out
-ds = ds.map(lambda ex: {"input_ids": tokenizer(ex["text"], truncation=True, max_length=MAX_SEQ_LEN)["input_ids"]})
-loader = DataLoader(ds, batch_size=BATCH_SIZE, collate_fn=lambda x: x) # no shuffle for streaming dataset
+start_thought_id = torch.tensor([
+    tokenizer.convert_tokens_to_ids("<think>")
+], device=DEVICE, dtype=torch.long)
+end_thought_id = torch.tensor([
+    tokenizer.convert_tokens_to_ids("</think>")
+], device=DEVICE, dtype=torch.long)
+
+
+def build_dataset() -> Dataset:
+    if DATA_CACHE_DIR.exists():
+        return Dataset.load_from_disk(str(DATA_CACHE_DIR))
+
+    streaming_ds = load_dataset(DATASET, split=SPLIT, streaming=True)
+    subset = []
+    for idx, example in enumerate(streaming_ds):
+        if idx >= MAX_DATASET_SAMPLES:
+            break
+        tokenized = tokenizer(
+            example["text"],
+            truncation=True,
+            max_length=MAX_SEQ_LEN,
+            add_special_tokens=False,
+        )
+        subset.append({"input_ids": tokenized["input_ids"]})
+    dataset = Dataset.from_list(subset)
+    DATA_CACHE_DIR.parent.mkdir(parents=True, exist_ok=True)
+    dataset.save_to_disk(str(DATA_CACHE_DIR))
+    return dataset
+
+
+def collate_fn(batch):
+    tensors = [torch.tensor(sample["input_ids"], dtype=torch.long) for sample in batch]
+    padded = pad_sequence(tensors, batch_first=True, padding_value=tokenizer.pad_token_id)
+    attention_mask = (padded != tokenizer.pad_token_id).long()
+    return {"input_ids": padded, "attention_mask": attention_mask}
+
+
+dataset = build_dataset()
+loader = DataLoader(dataset.shuffle(seed=42), batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
 
 # -----------------------------
 # Training loop
@@ -128,127 +159,190 @@ global_step = 0
 for epoch in range(NUM_EPOCHS):
     loop = tqdm(loader, desc=f"Epoch {epoch}")
     for batch_raw in loop:
-        # collate: batch_raw is a list of dataset items; we handle batch size 1 primarily
-        item = batch_raw[0]
-        full_input_ids = torch.tensor(item["input_ids"], dtype=torch.long).unsqueeze(0).to(DEVICE)  # (1, L)
-        L = full_input_ids.size(1)
-        # choose some positions t to apply RLP on in this example: for fast debug pick a few
-        # In large runs you'd iterate t across the sequence (possibly sampled)
-        candidate_positions = list(range(1, max(2, min(L - HORIZON - 1, 8))))  # up to 8 pos or less
-        if len(candidate_positions) == 0:
+        input_ids = batch_raw["input_ids"].to(DEVICE)
+        attention_mask = batch_raw["attention_mask"].to(DEVICE)
+        lengths = attention_mask.sum(dim=1)
+
+        valid_mask = lengths > 2
+        if valid_mask.sum() == 0:
+            continue
+        input_ids = input_ids[valid_mask]
+        attention_mask = attention_mask[valid_mask]
+        lengths = lengths[valid_mask]
+
+        horizons = torch.clamp(lengths - 1, min=1)
+        horizons = torch.minimum(horizons, torch.full_like(horizons, HORIZON))
+        max_prefix = lengths - horizons
+        prefix_valid = max_prefix > 1
+        if prefix_valid.sum() == 0:
             continue
 
-        # Snapshot theta_old for sampling (behavior policy)
+        input_ids = input_ids[prefix_valid]
+        lengths = lengths[prefix_valid]
+        horizons = horizons[prefix_valid]
+        max_prefix = max_prefix[prefix_valid]
+
+        rand = torch.rand_like(lengths, dtype=torch.float)
+        prefix_lengths = 1 + torch.floor(rand * (max_prefix.float() - 1)).long()
+
         with torch.no_grad():
             theta_old_model.load_state_dict(model.state_dict())
         theta_old_model.eval()
 
-        # For each selected position t, compute G rollouts and returns; then accumulate surrogate losses
-        surrogate_losses = []
-        for t in candidate_positions:
-            prefix, gold_window = make_prefix_and_gold_from_full_input(full_input_ids, t)  # shapes (1, P), (1, H)
-            P = prefix.size(1)
-            H_current = gold_window.size(1)
+        baseline_sequences = []
+        baseline_prefix_lengths = []
+        gold_lengths = []
+        discounts = []
+        thought_sequences = []
+        thought_prefix_lengths = []
+        thought_token_lengths = []
+        reasoned_sequences = []
+        reasoned_prefix_lengths = []
+        gold_lengths_expanded = []
+        thoughts_per_sample = []
 
-            # compute s_ema per token under EMA model (no-think baseline)
+        start_marker = start_thought_id
+        end_marker = end_thought_id
+
+        global_idx = 0
+        for sample_idx in range(input_ids.size(0)):
+            seq_len = lengths[sample_idx].item()
+            horizon_len = horizons[sample_idx].item()
+            prefix_len = prefix_lengths[sample_idx].item()
+            seq = input_ids[sample_idx, :seq_len]
+
+            gold_tokens = seq[prefix_len : prefix_len + horizon_len]
+            if gold_tokens.size(0) == 0:
+                continue
+
+            prefix_tokens = seq[:prefix_len]
+            baseline_sequences.append(torch.cat([prefix_tokens, gold_tokens], dim=0))
+            baseline_prefix_lengths.append(prefix_len)
+            gold_lengths.append(gold_tokens.size(0))
+            exponents = torch.arange(gold_tokens.size(0), device=DEVICE, dtype=torch.float)
+            base = torch.full_like(exponents, GAMMA)
+            discounts.append(torch.pow(base, exponents))
+
+            prefix_with_marker = torch.cat([prefix_tokens, start_marker], dim=0).unsqueeze(0)
+            prefix_repeat = prefix_with_marker.repeat(G, 1)
+            attention_repeat = torch.ones_like(prefix_repeat)
             with torch.no_grad():
-                # EMA input: prefix + gold_window
-                ema_input = full_input_ids[:, :P+H_current] # (1, P+H)
-                # compute per-token logprobs for the gold_window under EMA
-                s_ema_per_token = compute_teacher_forced_logprobs(ema_model, ema_input, gold_window)  # (H,)
-                # shape already (H,) representing log p(x_{t+k} | x_{<t+k}) under EMA
-
-            # For rollouts we need:
-            # - sample G thoughts c_t^{(i)} ~ pi_{theta_old}( . | x_{<t})
-            # - compute reasoned per-token logprobs s_pred^i for horizon H under current model conditioned on prefix + c_t + gold_window
-            rollouts_ct = []
-            per_rollout_though_logprobs_old = []  # per-rollout per-token logprobs under theta_old for the thought tokens (for importance)
-            # Sample G thoughts using theta_old_model. Use generate for clarity; for production sample step-wise while recording logprobs.
-            for gidx in range(G):
-                # Simple generation: supply prefix, generate short CoT (max_new_tokens ~ 32)
-                # We generate only the CoT tokens, not the gold next tokens.
-                in_ids = torch.cat([prefix, start_thought_id], dim=1)  # (1, P+1)
-                # To call generate with prefix as tensors we need to decode + generate, or use generate with input_ids directly:
-                # use do_sample True and some sampling config
                 generated = theta_old_model.generate(
-                    in_ids, 
-                    attention_mask=torch.ones_like(in_ids),
-                    max_new_tokens=32, 
-                    do_sample=True, 
-                    top_p=0.95, 
-                    eos_token_id=[tokenizer.eos_token_id, end_thought_id.item()],
+                    prefix_repeat,
+                    attention_mask=attention_repeat,
+                    max_new_tokens=THOUGHT_MAX_TOKENS,
+                    do_sample=True,
+                    top_p=THOUGHT_TOP_P,
+                    temperature=THOUGHT_TEMPERATURE,
                     pad_token_id=tokenizer.pad_token_id,
+                    eos_token_id=[tokenizer.eos_token_id, end_marker.item()],
                 )
-                # generated contains prefix + cot + maybe EOS; remove the prefix part to get only cot tokens
-                cot_tokens = generated[:, P:]  # shape (1, C)
-                # TODO: add back and change G in normalization later if error experienced
-                # if cot_tokens.size(1) <= 1:
-                #     continue
-                # remove trailing eos if present
-                # (keep as-is; the logprob computation will handle exact tokens)
-                rollouts_ct.append(cot_tokens)
 
-                # compute per-token logprob of cot_tokens under theta_old (behavior). We'll need these to form log pi_old per token.
-                # For that, compute logits of theta_old over cot_tokens autoregressively conditioned on prefix.
-                with torch.no_grad():
-                    # we want the logprob of each token in cot_tokens (teacher forcing style)
-                    # logits where position j predicts next token j+1; probabilities for cot token u are at logits indices P+u-1
-                    per_token_logp_old = compute_teacher_forced_logprobs(theta_old_model, generated, cot_tokens)  # (C,)
-                    per_rollout_though_logprobs_old.append(per_token_logp_old.detach())
+            indices = []
+            for g in range(generated.size(0)):
+                thought_tokens = generated[g, prefix_with_marker.size(1) :]
+                if thought_tokens.size(0) == 0:
+                    thought_tokens = end_marker.clone()
+                else:
+                    end_positions = (thought_tokens == end_marker.item()).nonzero(as_tuple=False)
+                    if end_positions.numel() > 0:
+                        first_end = end_positions[0, 0]
+                        thought_tokens = thought_tokens[: first_end + 1]
+                    else:
+                        thought_tokens = torch.cat([thought_tokens, end_marker], dim=0)
 
-            # Now for each rollout evaluate the reasoned per-token log-probs under the current model (p_theta)
-            returns = []  # discounted returns R(c_t) for each rollout
-            per_rollout_thought_logprobs_new = []  # list of per-token logp for thought tokens under current model
-            for i in range(len(rollouts_ct)):
-                ct_tokens = rollouts_ct[i]         # shape (1, C)
-                # Build input: prefix + cot_tokens + gold_window
-                inp_reasoned = torch.cat([prefix, ct_tokens, gold_window], dim=1)  # (1, P+C+H)
-                # compute per-token log-probs under current model for gold_window
-                with torch.no_grad():
-                    s_pred_per_token = compute_teacher_forced_logprobs(model, inp_reasoned, gold_window)  # (H,)
-                # compute r_i per token = s_pred^i - s_ema^i
-                # ensure ema_per_token_logp has same length H_current
-                r_per_token = s_pred_per_token - s_ema_per_token.to(s_pred_per_token.device)
-                # discounted sum
-                R = torch.tensor([r_i * (GAMMA ** k) for k, r_i in enumerate(r_per_token)]).sum()
-                returns.append(R.detach())  # treat R as constant (no grad)
+                thought_tokens = thought_tokens.long().to(DEVICE)
+                prefix_and_thought = torch.cat([prefix_tokens, thought_tokens], dim=0)
+                reasoned_seq = torch.cat([prefix_and_thought, gold_tokens], dim=0)
 
-                # compute per-token logprobs of the thought tokens under current model (for policy)
-                # we'll compute the new-model per-token logprobs on the thought tokens conditioned on prefix
-                inp_for_cot_new = torch.cat([prefix, ct_tokens], dim=1)  # (1, P+C)
-                # Remove torch.no_grad() here since we need gradients for the policy loss
-                per_token_logp_new = compute_teacher_forced_logprobs(model, inp_for_cot_new, ct_tokens)  # (C,)
-                per_rollout_thought_logprobs_new.append(per_token_logp_new)  # (C,)
+                thought_sequences.append(prefix_and_thought)
+                thought_prefix_lengths.append(prefix_len)
+                thought_token_lengths.append(thought_tokens.size(0))
+                reasoned_sequences.append(reasoned_seq)
+                reasoned_prefix_lengths.append(prefix_len + thought_tokens.size(0))
+                gold_lengths_expanded.append(gold_tokens.size(0))
+                indices.append(global_idx)
+                global_idx += 1
 
-            # Convert returns to tensor and compute group-relative advantages (Eq.7)
-            returns_tensor = torch.stack(returns)  # (G,)
-            r_mean = returns_tensor.mean()
-            # advantage scaling factor G/(G-1)
-            advantages = (G / (G - 1)) * (returns_tensor - r_mean)  # shape (G,)
+            thoughts_per_sample.append(indices)
 
-            # For each rollout, compute per-thought clipped surrogate loss (Eq.8)
-            for i in range(G):
-                # per-token log probs under new/current (we have per_token_logp_new)
-                logp_new = per_rollout_thought_logprobs_new[i]  # shape (C,)
-                # per-token log probs under old/behavior (we computed earlier in rollouts_logprob_old_tokens)
-                logp_old = per_rollout_though_logprobs_old[i]      # shape (C,)
-                # importance ratios per token
-                log_rhos = logp_new - logp_old.to(logp_new.device)  # (C,)
-                rhos = torch.exp(log_rhos)                           # (C,)
-                # clip
-                clip_rhos = torch.clamp(rhos, 1.0 - EPS_CLIP_LOW, 1.0 + EPS_CLIP_HIGH)
-                A = advantages[i]  # scalar
-                # surrogate per token: min(rho * sg(A), clip(rho) * sg(A))
-                # negative sign because we maximize reward -> minimize negative surrogate
-                # Also divide by |c| as in Eq.8
-                surrogate_per_token = torch.min(rhos * A.detach(), clip_rhos * A.detach())
-                loss_i = - surrogate_per_token.mean()  # scalar
-                surrogate_losses.append(loss_i)
-
-        if len(surrogate_losses) == 0:
+        if not baseline_sequences or not thought_sequences:
             continue
 
-        total_loss = torch.stack(surrogate_losses).mean()
+        baseline_logps = batched_token_logprobs(
+            ema_model,
+            baseline_sequences,
+            baseline_prefix_lengths,
+            gold_lengths,
+            tokenizer.pad_token_id,
+            requires_grad=False,
+        )
+
+        reasoned_logps = batched_token_logprobs(
+            model,
+            reasoned_sequences,
+            reasoned_prefix_lengths,
+            gold_lengths_expanded,
+            tokenizer.pad_token_id,
+            requires_grad=False,
+        )
+
+        old_thought_logps = batched_token_logprobs(
+            theta_old_model,
+            thought_sequences,
+            thought_prefix_lengths,
+            thought_token_lengths,
+            tokenizer.pad_token_id,
+            requires_grad=False,
+        )
+
+        new_thought_logps = batched_token_logprobs(
+            model,
+            thought_sequences,
+            thought_prefix_lengths,
+            thought_token_lengths,
+            tokenizer.pad_token_id,
+            requires_grad=True,
+        )
+
+        advantages = [None] * len(thought_sequences)
+        for sample_idx, indices in enumerate(thoughts_per_sample):
+            if not indices:
+                continue
+            baseline_lp = baseline_logps[sample_idx]
+            discount = discounts[sample_idx]
+            rewards = []
+            for idx in indices:
+                delta = reasoned_logps[idx] - baseline_lp
+                reward = torch.dot(discount, delta.float())
+                rewards.append(reward)
+            rewards_tensor = torch.stack(rewards)
+            if rewards_tensor.size(0) > 1:
+                scale = rewards_tensor.size(0) / (rewards_tensor.size(0) - 1)
+                mean_reward = rewards_tensor.mean()
+                adv_values = scale * (rewards_tensor - mean_reward)
+            else:
+                adv_values = rewards_tensor - rewards_tensor.mean()
+            for local, global_index in enumerate(indices):
+                advantages[global_index] = adv_values[local]
+
+        loss_terms = []
+        for idx, advantage in enumerate(advantages):
+            if advantage is None:
+                continue
+            logp_new = new_thought_logps[idx]
+            logp_old = old_thought_logps[idx]
+            log_rhos = logp_new - logp_old.to(logp_new.device)
+            rhos = torch.exp(log_rhos)
+            clipped = torch.clamp(rhos, 1.0 - EPS_CLIP_LOW, 1.0 + EPS_CLIP_HIGH)
+            adv_detached = advantage.detach()
+            surrogate = torch.min(rhos * adv_detached, clipped * adv_detached)
+            loss_terms.append(-surrogate.mean())
+
+        if not loss_terms:
+            continue
+
+        total_loss = torch.stack(loss_terms).mean()
         optimizer.zero_grad()
         total_loss.backward()
         optimizer.step()

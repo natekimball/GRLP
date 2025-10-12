@@ -56,19 +56,19 @@ DEFAULT_TASKS = {
 
 
 @dataclass
-class GRLPConfig:
+class RLPConfig:
     thought_max_tokens: int = 128
     temperature: float = 0.7
     top_p: float = 0.9
     max_generation_tokens: int = 256
 
 
-class GRLPReasoningLM(LM):
+class RLPReasoningLM(LM):
     """Custom lm-eval adapter that injects an internal thought before scoring tokens.
 
     The model samples a chain-of-thought for each next-token prediction using the
     provided fine-tuned checkpoint.  Log-likelihoods and generation operate by
-    alternating between thought sampling and token prediction, matching the GRLP
+    alternating between thought sampling and token prediction, matching the RLP
     inference procedure.
     """
 
@@ -78,13 +78,13 @@ class GRLPReasoningLM(LM):
         tokenizer_path: str | None = None,
         batch_size: int = 1,
         device: str | None = None,
-        config: GRLPConfig | None = None,
+        config: RLPConfig | None = None,
     ) -> None:
         super().__init__()
 
         self._device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self._batch_size = batch_size
-        self._cfg = config or GRLPConfig()
+        self._cfg = config or RLPConfig()
 
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path or model_path, trust_remote_code=True)
         if self.tokenizer.pad_token is None:
@@ -260,6 +260,12 @@ def parse_args() -> argparse.Namespace:
         help="Evaluation batch size for lm-eval harness (number of prompts per forward pass).",
     )
     parser.add_argument(
+        "--model-type",
+        choices=("rlp", "hf"),
+        default="rlp",
+        help="Selects the evaluation adapter: 'rlp' uses the custom RLPReasoningLM, 'hf' uses the lm-eval Hugging Face backend.",
+    )
+    parser.add_argument(
         "--fewshot",
         type=int,
         default=0,
@@ -289,17 +295,25 @@ def main() -> None:
     tokenizer_path = args.tokenizer_path or args.model_path
     lm_eval_tasks = _resolve_tasks(args.tasks)
 
-    grlp_model = GRLPReasoningLM(
-        model_path=args.model_path,
-        tokenizer_path=tokenizer_path,
-        batch_size=args.batch_size,
-    )
+    eval_kwargs = {
+        "tasks": lm_eval_tasks,
+        "num_fewshot": args.fewshot,
+    }
 
-    results = evaluator.simple_evaluate(
-        model=grlp_model,
-        tasks=lm_eval_tasks,
-        num_fewshot=args.fewshot,
-    )
+    if args.model_type == "rlp":
+        eval_kwargs["model"] = RLPReasoningLM(
+            model_path=args.model_path,
+            tokenizer_path=tokenizer_path,
+            batch_size=args.batch_size,
+        )
+    else:
+        model_args = [f"pretrained={args.model_path}", f"batch_size={args.batch_size}", "trust_remote_code=True"]
+        if tokenizer_path != args.model_path:
+            model_args.append(f"tokenizer={tokenizer_path}")
+        eval_kwargs["model"] = "hf"
+        eval_kwargs["model_args"] = ",".join(model_args)
+
+    results = evaluator.simple_evaluate(**eval_kwargs)
 
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)

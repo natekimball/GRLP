@@ -5,6 +5,7 @@ Generalized RLP prototype (discounted-return advantage estimation)
 """
 
 import copy
+from contextlib import nullcontext
 from pathlib import Path
 
 import torch
@@ -43,6 +44,13 @@ LOGPROB_CHUNK_SIZE = 2                 # split large log-prob batches to save me
 N_data = 100
 dataset_dir = None
 
+AMP_ENABLED = DEVICE.startswith("cuda")
+AMP_DTYPE = torch.float16
+
+
+def autocast_context():
+    return torch.cuda.amp.autocast(dtype=AMP_DTYPE) if AMP_ENABLED else nullcontext()
+
 # -----------------------------
 # Helpers
 # -----------------------------
@@ -79,20 +87,21 @@ def batched_token_logprobs(
 
         padded, attention_mask, _ = pad_sequences_1d(seq_chunk, pad_token_id)
         with torch.set_grad_enabled(requires_grad):
-            outputs = model(input_ids=padded, attention_mask=attention_mask)
-            logits = outputs.logits[:, :-1, :]
-            log_probs = F.log_softmax(logits, dim=-1)
-            targets = padded[:, 1:]
-            gathered = log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+            with autocast_context():
+                outputs = model(input_ids=padded, attention_mask=attention_mask)
+                logits = outputs.logits[:, :-1, :]
+                log_probs = F.log_softmax(logits, dim=-1)
+                targets = padded[:, 1:]
+                gathered = log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
 
         for local_idx, (prefix_len, target_len) in enumerate(zip(prefix_chunk, target_chunk)):
             if target_len == 0:
-                empty = torch.zeros(0, device=gathered.device, dtype=gathered.dtype, requires_grad=requires_grad)
+                empty = torch.zeros(0, device=gathered.device, dtype=torch.float32, requires_grad=requires_grad)
                 results.append(empty)
                 continue
             start_pos = prefix_len - 1
             end_pos = start_pos + target_len
-            results.append(gathered[local_idx, start_pos:end_pos])
+            results.append(gathered[local_idx, start_pos:end_pos].to(dtype=torch.float32))
     return results
 
 
@@ -111,17 +120,29 @@ model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, trust_remote_code=True)
 if added_tokens > 0:
     model.resize_token_embeddings(len(tokenizer))
 
+if hasattr(model, "gradient_checkpointing_enable"):
+    model.gradient_checkpointing_enable()
+model.config.use_cache = False
+
 ema_model = copy.deepcopy(model).to(DEVICE)
+if hasattr(ema_model, "gradient_checkpointing_disable"):
+    ema_model.gradient_checkpointing_disable()
+ema_model.config.use_cache = True
 for p in ema_model.parameters():
     p.requires_grad_(False)
 
 # Reusable snapshot for behavior policy; avoid reallocating every step
 theta_old_model = copy.deepcopy(model).to(DEVICE)
 theta_old_model.eval()
+if hasattr(theta_old_model, "gradient_checkpointing_disable"):
+    theta_old_model.gradient_checkpointing_disable()
+theta_old_model.config.use_cache = True
 for p in theta_old_model.parameters():
     p.requires_grad_(False)
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
+
+scaler = torch.cuda.amp.GradScaler(enabled=AMP_ENABLED)
 
 start_thought_id = torch.tensor([
     tokenizer.convert_tokens_to_ids("<think>")
@@ -199,6 +220,7 @@ for epoch in range(NUM_EPOCHS):
 
         with torch.no_grad():
             theta_old_model.load_state_dict(model.state_dict())
+        theta_old_model.config.use_cache = True
         theta_old_model.eval()
 
         baseline_sequences = []
@@ -321,11 +343,11 @@ for epoch in range(NUM_EPOCHS):
         for sample_idx, indices in enumerate(thoughts_per_sample):
             if not indices:
                 continue
-            baseline_lp = baseline_logps[sample_idx]
+            baseline_lp = baseline_logps[sample_idx].float()
             discount = discounts[sample_idx]
             rewards = []
             for idx in indices:
-                delta = reasoned_logps[idx] - baseline_lp
+                delta = reasoned_logps[idx].float() - baseline_lp
                 reward = torch.dot(discount, delta.float())
                 rewards.append(reward)
             rewards_tensor = torch.stack(rewards)
@@ -342,12 +364,12 @@ for epoch in range(NUM_EPOCHS):
         for idx, advantage in enumerate(advantages):
             if advantage is None:
                 continue
-            logp_new = new_thought_logps[idx]
-            logp_old = old_thought_logps[idx]
-            log_rhos = logp_new - logp_old.to(logp_new.device)
+            logp_new = new_thought_logps[idx].float()
+            logp_old = old_thought_logps[idx].float().to(logp_new.device)
+            log_rhos = logp_new - logp_old
             rhos = torch.exp(log_rhos)
             clipped = torch.clamp(rhos, 1.0 - EPS_CLIP_LOW, 1.0 + EPS_CLIP_HIGH)
-            adv_detached = advantage.detach()
+            adv_detached = advantage.detach().float()
             surrogate = torch.min(rhos * adv_detached, clipped * adv_detached)
             loss_terms.append(-surrogate.mean())
 
@@ -356,8 +378,9 @@ for epoch in range(NUM_EPOCHS):
 
         total_loss = torch.stack(loss_terms).mean()
         optimizer.zero_grad()
-        total_loss.backward()
-        optimizer.step()
+        scaler.scale(total_loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
         # EMA update
         with torch.no_grad():

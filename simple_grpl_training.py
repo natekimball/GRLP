@@ -11,6 +11,7 @@ from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset, Dataset
 from tqdm import tqdm
+from pathlib import Path
 import os
 
 # -----------------------------
@@ -19,6 +20,7 @@ import os
 MODEL_NAME = "Qwen/Qwen3-0.6B-Base"   # change to local checkpoint if needed
 # DATASET = "allenai/dolma"
 DATASET = "HuggingFaceFW/fineweb"
+DATA_CACHE_DIR = Path("data/fineweb-100-tokenized")
 SPLIT = "train"       # small subset for debug; remove for real runs
 MAX_SEQ_LEN = 2048
 HORIZON = 32                          # reward horizon T (small for debug; paper uses long)
@@ -115,9 +117,9 @@ for p in theta_old_model.parameters():
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
 
-cached_subset_dir = f"data/{DATASET.split('/')[-1]}-{N_data}"
-if os.path.exists(cached_subset_dir):
-    ds = Dataset.load_from_disk(cached_subset_dir)
+# cached_subset_dir = f"data/{DATASET.split('/')[-1]}-{N_data}"
+if os.path.exists(DATA_CACHE_DIR):
+    ds = Dataset.load_from_disk(DATA_CACHE_DIR)
 else:
     # Load a small subset for debugging. For full experiments, remove slicing.
     ds = load_dataset(DATASET, split=SPLIT, streaming=True).take(N_data)
@@ -127,7 +129,7 @@ else:
         return out
     ds = ds.map(lambda ex: {"input_ids": tokenizer(ex["text"], truncation=True, max_length=MAX_SEQ_LEN)["input_ids"]})
     ds = Dataset.from_list(list(ds))
-    ds.save_to_disk(cached_subset_dir)
+    ds.save_to_disk(DATA_CACHE_DIR)
     
 loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=lambda x: x) # no shuffle for streaming dataset
 
@@ -273,7 +275,7 @@ for epoch in range(NUM_EPOCHS):
         loop.set_postfix({"loss": float(total_loss.detach().cpu()), "step": global_step})
 
     # optional: save checkpoint each epoch
-    model.save_pretrained(f"qwen3-0.6B-rlp-epoch{epoch}")
-    tokenizer.save_pretrained(f"qwen3-0.6B-rlp-epoch{epoch}")
+    model.save_pretrained(f"qwen3-0.6B-rlp-epoch{epoch}-simple")
+    tokenizer.save_pretrained(f"qwen3-0.6B-rlp-epoch{epoch}-simple")
 
 print("done")

@@ -6,7 +6,6 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 THINK_START = "<think>"
 THINK_END = "</think>"
 
-
 def load_model(model_path: str):
     model_path = Path(model_path)
     if not model_path.exists():
@@ -19,36 +18,7 @@ def load_model(model_path: str):
     model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True)
     return model, tokenizer
 
-
-def extract_reasoning_and_answer(new_tokens, tokenizer):
-    start_id = tokenizer.convert_tokens_to_ids(THINK_START)
-    end_id = tokenizer.convert_tokens_to_ids(THINK_END)
-
-    try:
-        start_idx = new_tokens.index(start_id)
-    except ValueError:
-        start_idx = None
-
-    try:
-        end_idx = new_tokens.index(end_id)
-    except ValueError:
-        end_idx = None
-
-    reasoning_text = None
-    answer_tokens = []
-
-    if start_idx is not None and end_idx is not None and end_idx > start_idx:
-        reasoning_ids = new_tokens[start_idx : end_idx + 1]
-        reasoning_text = tokenizer.decode(reasoning_ids, skip_special_tokens=False)
-        answer_tokens = new_tokens[end_idx + 1 : end_idx + 1 + 16]
-    else:
-        answer_tokens = new_tokens[:16]
-
-    answer_text = tokenizer.decode(answer_tokens, skip_special_tokens=True)
-    return reasoning_text, answer_text
-
-
-def generate(
+def rlp_generate(
     model,
     tokenizer,
     prompt: str,
@@ -57,7 +27,7 @@ def generate(
     temperature: float,
     top_p: float,
 ):
-    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+    inputs = tokenizer(prompt + THINK_START, return_tensors="pt").to(device)
     with torch.no_grad():
         output = model.generate(
             **inputs,
@@ -69,8 +39,28 @@ def generate(
             pad_token_id=tokenizer.pad_token_id,
         )
 
-    new_token_ids = output[0, inputs["input_ids"].size(1) :].tolist()
-    return extract_reasoning_and_answer(new_token_ids, tokenizer)
+    if output[0, -1].item() == tokenizer.eos_token_id:
+        output = output[:, :-1]
+    if output[0, -1].item() != tokenizer.convert_tokens_to_ids(THINK_END):
+        output = torch.cat(
+            [output, torch.tensor([[tokenizer.convert_tokens_to_ids(THINK_END)]], device=device)], dim=1
+        )
+    
+    with torch.no_grad():
+        attention_mask = torch.ones_like(output)
+        full_output = model.generate(
+            input_ids=output,
+            attention_mask=attention_mask,
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            top_p=top_p,
+            temperature=temperature,
+            eos_token_id=tokenizer.eos_token_id,
+            pad_token_id=tokenizer.pad_token_id,
+        )
+        
+    return tokenizer.decode(full_output[0], skip_special_tokens=False)
+
 
 
 def parse_args():
@@ -116,7 +106,7 @@ def main():
     model.to(device)
     model.eval()
 
-    reasoning, answer = generate(
+    sequence = rlp_generate(
         model,
         tokenizer,
         args.prompt,
@@ -126,14 +116,7 @@ def main():
         args.top_p,
     )
 
-    if reasoning:
-        print("Reasoning:")
-        print(reasoning)
-    else:
-        print("Reasoning: <none>")
-
-    print("\nAnswer (16 tokens):")
-    print(answer.strip())
+    print(sequence)
 
 
 if __name__ == "__main__":

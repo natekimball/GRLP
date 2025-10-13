@@ -7,9 +7,9 @@ THINK_START = "<think>"
 THINK_END = "</think>"
 
 def load_model(model_path: str):
-    model_path = Path(model_path)
-    if not model_path.exists():
-        raise FileNotFoundError(f"Model path not found: {model_path}")
+    # model_path = Path(model_path)
+    # if not model_path.exists():
+    #     raise FileNotFoundError(f"Model path not found: {model_path}")
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     if tokenizer.pad_token is None:
@@ -27,6 +27,7 @@ def rlp_generate(
     temperature: float,
     top_p: float,
 ):
+    inputs = tokenizer(prompt + THINK_START, return_tensors="pt").to(device)
     inputs = tokenizer(prompt + THINK_START, return_tensors="pt").to(device)
     with torch.no_grad():
         output = model.generate(
@@ -103,6 +104,10 @@ def main():
     device = torch.device(args.device)
 
     model, tokenizer = load_model(args.model_path)
+    # MODEL_NAME = "Qwen/Qwen3-0.6B-Base"   # change to local checkpoint if needed
+    # model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, trust_remote_code=True)
+    # tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
+
     model.to(device)
     model.eval()
 

@@ -58,7 +58,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--split",
         type=str,
-        default="train",
+        default="test",
         help="Dataset split to use for training.",
     )
     parser.add_argument(
@@ -70,7 +70,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="./qwen_math_sft",
+        default="./qwen3-0.6B-math-sft",
         help="Directory to stash checkpoints and logs.",
     )
     parser.add_argument(
@@ -112,7 +112,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--num_train_epochs",
         type=int,
-        default=3,
+        default=1,
         help="Total training epochs.",
     )
     parser.add_argument(
@@ -227,8 +227,9 @@ def main() -> None:
     model = AutoModelForCausalLM.from_pretrained(args.model_name)
 
     raw_dataset = load_dataset(args.dataset_name)
+    print(raw_dataset)
 
-    sample_keys = prepare_keys(raw_dataset[args.split].features, args)
+    sample_keys = prepare_keys(raw_dataset[args.split].column_names, args)
 
     tokenized_dataset = raw_dataset.map(
         tokenize_function(tokenizer, sample_keys, args.max_seq_length),
@@ -255,7 +256,7 @@ def main() -> None:
         num_train_epochs=args.num_train_epochs,
         warmup_ratio=args.warmup_ratio,
         logging_steps=args.logging_steps,
-        evaluation_strategy=args.eval_strategy,
+        eval_strategy=args.eval_strategy,
         save_strategy=args.save_strategy,
         bf16=args.bf16,
         fp16=args.fp16,

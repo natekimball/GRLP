@@ -16,21 +16,28 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import Dataset, load_dataset
 from tqdm import tqdm
 import os
+import argparse
 
 # -----------------------------
 # Config
 # -----------------------------
-MODEL_NAME = "Qwen/Qwen3-0.6B-Base"   # change to local checkpoint if needed
+# Parse command line arguments
+parser = argparse.ArgumentParser(description="Generalized RLP prototype training")
+parser.add_argument("--model-name", type=str, default="Qwen/Qwen3-0.6B-Base", help="Model name or path to saved model")
+args = parser.parse_args()
+
+MODEL_NAME = args.model_name
 # DATASET = "allenai/dolma"
 DATASET = "HuggingFaceFW/fineweb"
 SPLIT = "train"       # small subset for debug; remove for real runs
 MAX_SEQ_LEN = 2048
-HORIZON = 32                          # reward horizon T (small for debug; paper uses long)
+HORIZON = 8                          # reward horizon T (small for debug; paper uses long)
 G = 4                                  # number of rollouts per context
-GAMMA = 0.9                            # discount factor
+GAMMA = 0.7                            # discount factor
 BATCH_SIZE = 4                         # leverage batching for better GPU utilization
-MAX_DATASET_SAMPLES = 10_000           # cap for cached subset
-DATA_CACHE_DIR = Path("data/fineweb-10k-tokenized")
+MAX_DATASET_SAMPLES = 100_000           # cap for cached subset
+# DATA_CACHE_DIR = Path("data/fineweb-10k-tokenized")
+DATA_CACHE_DIR = Path("data/fineweb-100k-tokenized")
 THOUGHT_MAX_TOKENS = 128
 THOUGHT_TOP_P = 0.95
 THOUGHT_TEMPERATURE = 0.7
@@ -40,9 +47,7 @@ EPS_CLIP_LOW, EPS_CLIP_HIGH = 0.1, 0.1 # PPO clipping
 NUM_EPOCHS = 1
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 LOGPROB_CHUNK_SIZE = 2                 # split large log-prob batches to save memory
-# N_data = 10_000
-N_data = 100
-dataset_dir = None
+DEBUG_LOG_PATH = Path("debug-2.txt")
 
 AMP_ENABLED = DEVICE.startswith("cuda")
 AMP_DTYPE = torch.float16
@@ -187,6 +192,7 @@ loader = DataLoader(dataset.shuffle(seed=42), batch_size=BATCH_SIZE, shuffle=Tru
 # -----------------------------
 # Training loop
 # -----------------------------
+debug = open(DEBUG_LOG_PATH, 'w+')
 model.train()
 global_step = 0
 for epoch in range(NUM_EPOCHS):
@@ -260,6 +266,10 @@ for epoch in range(NUM_EPOCHS):
             prefix_with_marker = torch.cat([prefix_tokens, start_marker], dim=0).unsqueeze(0)
             prefix_repeat = prefix_with_marker.repeat(G, 1)
             attention_repeat = torch.ones_like(prefix_repeat)
+            
+            decoded_prefix = tokenizer.decode(prefix_tokens[-10:].tolist(), skip_special_tokens=False)
+            debug.write(f"Step {global_step}, Prefix (last 10 tokens): {repr(decoded_prefix)}\n")
+            
             with torch.no_grad():
                 generated = theta_old_model.generate(
                     prefix_repeat,
@@ -271,6 +281,10 @@ for epoch in range(NUM_EPOCHS):
                     pad_token_id=tokenizer.pad_token_id,
                     eos_token_id=[tokenizer.eos_token_id, end_marker.item()],
                 )
+                # Decode and log the last few tokens of the prefix and the generated text
+                # decoded_generated = tokenizer.batch_decode(generated)
+                decoded_generated = tokenizer.decode(generated[0, prefix_with_marker.size(0):].tolist())
+                debug.write(f"Generated thought: {repr(decoded_generated.split('<|endoftext|>')[0])}\n")
 
             indices = []
             for g in range(generated.size(0)):
@@ -391,7 +405,8 @@ for epoch in range(NUM_EPOCHS):
         loop.set_postfix({"loss": float(total_loss.detach().cpu()), "step": global_step})
 
     # optional: save checkpoint each epoch
-    model.save_pretrained(f"qwen3-0.6B-rlp-epoch{epoch}")
-    tokenizer.save_pretrained(f"qwen3-0.6B-rlp-epoch{epoch}")
+    save_dir = f"{MODEL_NAME.split('/')[-1]}-grlp-epoch{epoch}"
+    model.save_pretrained(save_dir)
+    tokenizer.save_pretrained(save_dir)
 
 print("done")

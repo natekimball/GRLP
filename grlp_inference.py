@@ -7,10 +7,6 @@ THINK_START = "<think>"
 THINK_END = "</think>"
 
 def load_model(model_path: str):
-    # model_path = Path(model_path)
-    # if not model_path.exists():
-    #     raise FileNotFoundError(f"Model path not found: {model_path}")
-
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -60,7 +56,7 @@ def rlp_generate(
             pad_token_id=tokenizer.pad_token_id,
         )
         
-    return tokenizer.decode(full_output[0], skip_special_tokens=False)
+    return tokenizer.decode(full_output[0])
 
 
 

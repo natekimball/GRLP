@@ -5,23 +5,30 @@ Generalized RLP prototype (discounted-return advantage estimation)
 """
 
 import copy
+import os
+from pathlib import Path
+
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset, Dataset
 from tqdm import tqdm
-from pathlib import Path
-import os
+import argparse
 
 # -----------------------------
 # Config
 # -----------------------------
-MODEL_NAME = "Qwen/Qwen3-0.6B-Base"   # change to local checkpoint if needed
+# Parse command line arguments
+parser = argparse.ArgumentParser(description="Generalized RLP prototype training")
+parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-0.6B-Base", help="Model name or path to saved model")
+args = parser.parse_args()
+
+MODEL_NAME = args.model_name
 # DATASET = "allenai/dolma"
 DATASET = "HuggingFaceFW/fineweb"
+SPLIT = "train"
 DATA_CACHE_DIR = Path("data/fineweb-100-tokenized")
-SPLIT = "train"       # small subset for debug; remove for real runs
 MAX_SEQ_LEN = 2048
 HORIZON = 32                          # reward horizon T (small for debug; paper uses long)
 G = 4                                  # number of rollouts per context
@@ -33,8 +40,9 @@ EPS_CLIP_LOW, EPS_CLIP_HIGH = 0.1, 0.1 # PPO clipping
 NUM_EPOCHS = 1
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # N_data = 10_000
-N_data = 100
+N_data = 1000
 dataset_dir = None
+DEBUG_LOG_PATH = Path("debug.txt")
 
 # -----------------------------
 # Helpers
@@ -104,6 +112,14 @@ start_thought_id = tokenizer("<think>", return_tensors="pt").input_ids.to(DEVICE
 end_thought_id = tokenizer("</think>", return_tensors="pt").input_ids.to(DEVICE)
 
 
+def log_sampled_thought(step_idx: int, epoch_idx: int, position: int, rollout_idx: int, token_ids: torch.Tensor) -> None:
+    """Append the decoded chain-of-thought sample to the debug log."""
+    decoded = tokenizer.decode(token_ids.tolist(), skip_special_tokens=False)
+    with DEBUG_LOG_PATH.open("a", encoding="utf-8") as log_file:
+        log_file.write(f"[step={step_idx} epoch={epoch_idx} t={position} rollout={rollout_idx}]\n")
+        log_file.write(repr(decoded) + "\n\n")
+
+
 model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, trust_remote_code=True).to(DEVICE)
 ema_model = copy.deepcopy(model).to(DEVICE)
 for p in ema_model.parameters():
@@ -117,7 +133,6 @@ for p in theta_old_model.parameters():
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
 
-# cached_subset_dir = f"data/{DATASET.split('/')[-1]}-{N_data}"
 if os.path.exists(DATA_CACHE_DIR):
     ds = Dataset.load_from_disk(DATA_CACHE_DIR)
 else:
@@ -132,6 +147,9 @@ else:
     ds.save_to_disk(DATA_CACHE_DIR)
     
 loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=lambda x: x) # no shuffle for streaming dataset
+
+# reset log for new training run
+DEBUG_LOG_PATH.write_text("", encoding="utf-8")
 
 # -----------------------------
 # Training loop
@@ -194,6 +212,7 @@ for epoch in range(NUM_EPOCHS):
                 )
                 # generated contains prefix + cot + maybe EOS; remove the prefix part to get only cot tokens
                 cot_tokens = generated[:, P:]  # shape (1, C)
+                log_sampled_thought(global_step, epoch, t, gidx, cot_tokens.squeeze(0))
                 # TODO: add back and change G in normalization later if error experienced
                 # if cot_tokens.size(1) <= 1:
                 #     continue
@@ -275,7 +294,7 @@ for epoch in range(NUM_EPOCHS):
         loop.set_postfix({"loss": float(total_loss.detach().cpu()), "step": global_step})
 
     # optional: save checkpoint each epoch
-    model.save_pretrained(f"qwen3-0.6B-rlp-epoch{epoch}-simple")
-    tokenizer.save_pretrained(f"qwen3-0.6B-rlp-epoch{epoch}-simple")
+    model.save_pretrained(f"qwen3-0.6B-rlp-epoch{epoch}")
+    tokenizer.save_pretrained(f"qwen3-0.6B-rlp-epoch{epoch}")
 
 print("done")

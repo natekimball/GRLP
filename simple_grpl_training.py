@@ -227,7 +227,8 @@ for epoch in range(NUM_EPOCHS):
             # - sample G thoughts c_t^{(i)} ~ pi_{theta_old}( . | x_{<t})
             # - compute reasoned per-token logprobs s_pred^i for horizon H under current model conditioned on prefix + c_t + gold_window
             rollouts_ct = []
-            per_rollout_though_logprobs_old = []  # per-rollout per-token logprobs under theta_old for the thought tokens (for importance)
+            per_rollout_thought_logprobs_new = []  # per-rollout per-token logprobs under current model for thought tokens
+            per_rollout_thought_logprobs_old = []  # per-rollout per-token logprobs under theta_old for the thought tokens (for importance)
             # Sample G thoughts using theta_old_model. Use generate for clarity; for production sample step-wise while recording logprobs.
             # Simple generation: supply prefix, generate short CoT (max_new_tokens ~ 32)
             # We generate only the CoT tokens, not the gold next tokens.
@@ -273,11 +274,10 @@ for epoch in range(NUM_EPOCHS):
                     # we want the logprob of each token in cot_tokens (teacher forcing style)
                     # logits where position j predicts next token j+1; probabilities for cot token u are at logits indices P+u-1
                     per_token_logp_old = compute_teacher_forced_logprobs(theta_old_model, generated, cot_tokens)  # (C,)
-                    per_rollout_though_logprobs_old.append(per_token_logp_old.detach())
+                    per_rollout_thought_logprobs_old.append(per_token_logp_old.detach())
 
             # Now for each rollout evaluate the reasoned per-token log-probs under the current model (p_theta)
             returns = []  # discounted returns R(c_t) for each rollout
-            per_rollout_thought_logprobs_new = []  # list of per-token logp for thought tokens under current model
             for i in range(len(rollouts_ct)):
                 ct_tokens = rollouts_ct[i]         # shape (1, C)
                 # Build input: prefix + cot_tokens + gold_window
@@ -304,7 +304,7 @@ for epoch in range(NUM_EPOCHS):
                 # per-token log probs under new/current (we have per_token_logp_new)
                 logp_new = per_rollout_thought_logprobs_new[i]  # shape (C,)
                 # per-token log probs under old/behavior (we computed earlier in rollouts_logprob_old_tokens)
-                logp_old = per_rollout_though_logprobs_old[i]      # shape (C,)
+                logp_old = per_rollout_thought_logprobs_old[i]      # shape (C,)
                 # importance ratios per token
                 log_rhos = logp_new - logp_old.to(logp_new.device)  # (C,)
                 rhos = torch.exp(log_rhos)                           # (C,)

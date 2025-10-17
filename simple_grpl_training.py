@@ -52,8 +52,8 @@ reward_history = []
 cot_length_history = []
 loss_history = []
 step_history = []
-PLOT_SAVE_INTERVAL = 100
-MODEL_SAVE_INTERVAL = 1000
+PLOT_SAVE_INTERVAL = 20
+MODEL_SAVE_INTERVAL = 200
 METRIC_FIG_PATH = Path("simple_grpl_training_metrics.png")
 
 
@@ -345,7 +345,7 @@ for epoch in range(NUM_EPOCHS):
             if global_step % PLOT_SAVE_INTERVAL == 0:
                 save_metric_plot()
         
-        if global_step % MODEL_SAVE_INTERVAL == MODEL_SAVE_INTERVAL - 1:
+        if global_step and global_step % MODEL_SAVE_INTERVAL == 0:
             save_dir = f"{MODEL_NAME.split('/')[-1]}-grlp-epoch{epoch}-step{global_step}"
             model.save_pretrained(save_dir)
             tokenizer.save_pretrained(save_dir)

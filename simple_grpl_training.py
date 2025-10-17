@@ -34,6 +34,7 @@ SPLIT = "train"
 DATA_CACHE_DIR = Path("data/fineweb-100-tokenized")
 MAX_SEQ_LEN = 2048
 HORIZON = 8                          # reward horizon T (small for debug; paper uses long)
+THOUGHT_MAX_TOKENS = 1024
 G = 16                                  # number of rollouts per context
 GAMMA = 0.7                            # discount factor
 BATCH_SIZE = 1                         # token-level RLP is expensive; tune for your memory
@@ -228,16 +229,16 @@ for epoch in range(NUM_EPOCHS):
             rollouts_ct = []
             per_rollout_though_logprobs_old = []  # per-rollout per-token logprobs under theta_old for the thought tokens (for importance)
             # Sample G thoughts using theta_old_model. Use generate for clarity; for production sample step-wise while recording logprobs.
+            # Simple generation: supply prefix, generate short CoT (max_new_tokens ~ 32)
+            # We generate only the CoT tokens, not the gold next tokens.
+            in_ids = torch.cat([prefix, start_thought_id], dim=1)  # (1, P+1)
             for gidx in range(G):
-                # Simple generation: supply prefix, generate short CoT (max_new_tokens ~ 32)
-                # We generate only the CoT tokens, not the gold next tokens.
-                in_ids = torch.cat([prefix, start_thought_id], dim=1)  # (1, P+1)
                 # To call generate with prefix as tensors we need to decode + generate, or use generate with input_ids directly:
                 # use do_sample True and some sampling config
                 generated = theta_old_model.generate(
                     in_ids, 
                     attention_mask=torch.ones_like(in_ids),
-                    max_new_tokens=32, 
+                    max_new_tokens=THOUGHT_MAX_TOKENS,
                     do_sample=True, 
                     top_p=0.95, 
                     eos_token_id=[tokenizer.eos_token_id, end_thought_id.item()],
@@ -246,6 +247,10 @@ for epoch in range(NUM_EPOCHS):
                 # generated contains prefix + cot + maybe EOS; remove the prefix part to get only cot tokens
                 cot_tokens = generated[:, P:]  # shape (1, C)
                 log_sampled_thought(global_step, epoch, t, gidx, cot_tokens.squeeze(0))
+                # TODO: add </think> to the cot here and in logprobs new
+                # if cot_tokens[0, -1] == tokenizer.eos_token_id:
+                #     cot_tokens = torch.cat([cot_tokens[:, :-1], end_thought_id], dim=1)
+
                 # TODO: add back and change G in normalization later if error experienced
                 # if cot_tokens.size(1) <= 1:
                 #     continue
@@ -254,10 +259,14 @@ for epoch in range(NUM_EPOCHS):
                 rollouts_ct.append(cot_tokens)
                 batch_cot_lengths.append(int(cot_tokens.size(1)))
 
-                # compute per-token logprob of cot_tokens under theta_old (behavior). We'll need these to form log pi_old per token.
+                # compute per-token logprobs of the thought tokens under current model (for policy)
                 # For that, compute logits of theta_old over cot_tokens autoregressively conditioned on prefix.
+                # Remove torch.no_grad() here since we need gradients for the policy loss
+                per_token_logp_new = compute_teacher_forced_logprobs(model, generated, cot_tokens)  # (C,)
+                per_rollout_thought_logprobs_new.append(per_token_logp_new)  # (C,)
+
+                # compute per-token logprob of cot_tokens under theta_old (behavior). We'll need these to form log pi_old per token.
                 with torch.no_grad():
-                    # TODO: add </think> to the cot here and in logprobs new
                     # we want the logprob of each token in cot_tokens (teacher forcing style)
                     # logits where position j predicts next token j+1; probabilities for cot token u are at logits indices P+u-1
                     per_token_logp_old = compute_teacher_forced_logprobs(theta_old_model, generated, cot_tokens)  # (C,)
@@ -280,13 +289,6 @@ for epoch in range(NUM_EPOCHS):
                 R = torch.tensor([r_i * (GAMMA ** k) for k, r_i in enumerate(r_per_token)]).sum()
                 returns.append(R.detach())  # treat R as constant (no grad)
                 batch_rewards.append(float(R.detach().cpu()))
-
-                # compute per-token logprobs of the thought tokens under current model (for policy)
-                # we'll compute the new-model per-token logprobs on the thought tokens conditioned on prefix
-                inp_for_cot_new = torch.cat([prefix, ct_tokens], dim=1)  # (1, P+C)
-                # Remove torch.no_grad() here since we need gradients for the policy loss
-                per_token_logp_new = compute_teacher_forced_logprobs(model, inp_for_cot_new, ct_tokens)  # (C,)
-                per_rollout_thought_logprobs_new.append(per_token_logp_new)  # (C,)
 
             # Convert returns to tensor and compute group-relative advantages (Eq.7)
             returns_tensor = torch.stack(returns)  # (G,)

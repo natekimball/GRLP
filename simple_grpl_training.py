@@ -31,7 +31,7 @@ MODEL_NAME = args.model_name
 # DATASET = "allenai/dolma"
 DATASET = "HuggingFaceFW/fineweb"
 SPLIT = "train"
-DATA_CACHE_DIR = Path("data/fineweb-100-tokenized")
+DATA_CACHE_DIR = Path("data/fineweb-10k-tokenized")
 MAX_SEQ_LEN = 2048
 HORIZON = 8                          # reward horizon T (small for debug; paper uses long)
 THOUGHT_MAX_TOKENS = 1024
@@ -43,8 +43,8 @@ TAU = 0.999                            # EMA decay
 EPS_CLIP_LOW, EPS_CLIP_HIGH = 0.1, 0.1 # PPO clipping
 NUM_EPOCHS = 1
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-# N_data = 10_000
-N_data = 1000
+N_data = 10_000
+# N_data = 1000
 dataset_dir = None
 DEBUG_LOG_PATH = Path("debug.txt")
 
@@ -248,8 +248,11 @@ for epoch in range(NUM_EPOCHS):
                 cot_tokens = generated[:, P:]  # shape (1, C)
                 log_sampled_thought(global_step, epoch, t, gidx, cot_tokens.squeeze(0))
                 # TODO: add </think> to the cot here and in logprobs new
-                # if cot_tokens[0, -1] == tokenizer.eos_token_id:
-                #     cot_tokens = torch.cat([cot_tokens[:, :-1], end_thought_id], dim=1)
+                if cot_tokens[0, -1] == tokenizer.eos_token_id:
+                    cot_tokens[0, -1] = end_thought_id.item()
+                elif cot_tokens[0, -1] != end_thought_id.item():
+                    # append </think>
+                    cot_tokens = torch.cat([cot_tokens, end_thought_id], dim=1)
 
                 # TODO: add back and change G in normalization later if error experienced
                 # if cot_tokens.size(1) <= 1:

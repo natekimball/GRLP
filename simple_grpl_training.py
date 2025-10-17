@@ -15,6 +15,9 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset, Dataset
 from tqdm import tqdm
 import argparse
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 # -----------------------------
 # Config
@@ -43,6 +46,34 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 N_data = 1000
 dataset_dir = None
 DEBUG_LOG_PATH = Path("debug.txt")
+
+# Metric tracking for visualization
+reward_history = []
+cot_length_history = []
+loss_history = []
+step_history = []
+PLOT_SAVE_INTERVAL = 100
+MODEL_SAVE_INTERVAL = 1000
+METRIC_FIG_PATH = Path("simple_grpl_training_metrics.png")
+
+
+def save_metric_plot():
+    if not reward_history:
+        return
+    fig, axes = plt.subplots(3, 1, figsize=(8, 8), sharex=True)
+    axes[0].plot(step_history, reward_history, color="tab:blue")
+    axes[0].set_ylabel("Avg Reward")
+    axes[0].grid(alpha=0.3)
+    axes[1].plot(step_history, cot_length_history, color="tab:orange")
+    axes[1].set_ylabel("Avg CoT Tokens")
+    axes[1].grid(alpha=0.3)
+    axes[2].plot(step_history, loss_history, color="tab:green")
+    axes[2].set_ylabel("Loss")
+    axes[2].set_xlabel("Global Step")
+    axes[2].grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(METRIC_FIG_PATH, bbox_inches="tight")
+    plt.close(fig)
 
 # -----------------------------
 # Helpers
@@ -176,6 +207,8 @@ for epoch in range(NUM_EPOCHS):
 
         # For each selected position t, compute G rollouts and returns; then accumulate surrogate losses
         surrogate_losses = []
+        batch_rewards = []
+        batch_cot_lengths = []
         for t in candidate_positions:
             prefix, gold_window = make_prefix_and_gold_from_full_input(full_input_ids, t)  # shapes (1, P), (1, H)
             P = prefix.size(1)
@@ -219,6 +252,7 @@ for epoch in range(NUM_EPOCHS):
                 # remove trailing eos if present
                 # (keep as-is; the logprob computation will handle exact tokens)
                 rollouts_ct.append(cot_tokens)
+                batch_cot_lengths.append(int(cot_tokens.size(1)))
 
                 # compute per-token logprob of cot_tokens under theta_old (behavior). We'll need these to form log pi_old per token.
                 # For that, compute logits of theta_old over cot_tokens autoregressively conditioned on prefix.
@@ -244,6 +278,7 @@ for epoch in range(NUM_EPOCHS):
                 # discounted sum
                 R = torch.tensor([r_i * (GAMMA ** k) for k, r_i in enumerate(r_per_token)]).sum()
                 returns.append(R.detach())  # treat R as constant (no grad)
+                batch_rewards.append(float(R.detach().cpu()))
 
                 # compute per-token logprobs of the thought tokens under current model (for policy)
                 # we'll compute the new-model per-token logprobs on the thought tokens conditioned on prefix
@@ -285,16 +320,41 @@ for epoch in range(NUM_EPOCHS):
         total_loss.backward()
         optimizer.step()
 
+        avg_reward_value = float(sum(batch_rewards) / len(batch_rewards)) if batch_rewards else None
+        avg_cot_length_value = float(sum(batch_cot_lengths) / len(batch_cot_lengths)) if batch_cot_lengths else None
+        loss_value = float(total_loss.detach().cpu())
+
         # EMA update
         with torch.no_grad():
             for p_ema, p in zip(ema_model.parameters(), model.parameters()):
                 p_ema.data.mul_(TAU).add_(p.data, alpha=1.0 - TAU)
 
         global_step += 1
-        loop.set_postfix({"loss": float(total_loss.detach().cpu()), "step": global_step})
+        postfix = {"loss": loss_value, "step": global_step}
+        if avg_reward_value is not None:
+            postfix["avg_reward"] = avg_reward_value
+        if avg_cot_length_value is not None:
+            postfix["avg_cot_len"] = avg_cot_length_value
+        loop.set_postfix(postfix)
+
+        if avg_reward_value is not None and avg_cot_length_value is not None:
+            reward_history.append(avg_reward_value)
+            cot_length_history.append(avg_cot_length_value)
+            loss_history.append(loss_value)
+            step_history.append(global_step)
+            if global_step % PLOT_SAVE_INTERVAL == 0:
+                save_metric_plot()
+        
+        if global_step % MODEL_SAVE_INTERVAL == MODEL_SAVE_INTERVAL - 1:
+            save_dir = f"{MODEL_NAME.split('/')[-1]}-grlp-epoch{epoch}-step{global_step}"
+            model.save_pretrained(save_dir)
+            tokenizer.save_pretrained(save_dir)
 
     # optional: save checkpoint each epoch
-    model.save_pretrained(f"qwen3-0.6B-rlp-epoch{epoch}")
-    tokenizer.save_pretrained(f"qwen3-0.6B-rlp-epoch{epoch}")
+    save_dir = f"{MODEL_NAME.split('/')[-1]}-grlp-epoch{epoch}"
+    model.save_pretrained(save_dir)
+    tokenizer.save_pretrained(save_dir)
+
+save_metric_plot()
 
 print("done")

@@ -17,6 +17,9 @@ from datasets import Dataset, load_dataset
 from tqdm import tqdm
 import os
 import argparse
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 # -----------------------------
 # Config
@@ -32,16 +35,16 @@ DATASET = "HuggingFaceFW/fineweb"
 SPLIT = "train"       # small subset for debug; remove for real runs
 MAX_SEQ_LEN = 2048
 HORIZON = 8                          # reward horizon T (small for debug; paper uses long)
-G = 4                                  # number of rollouts per context
+G = 8                                  # number of rollouts per context
 GAMMA = 0.7                            # discount factor
 BATCH_SIZE = 4                         # leverage batching for better GPU utilization
 MAX_DATASET_SAMPLES = 100_000           # cap for cached subset
 # DATA_CACHE_DIR = Path("data/fineweb-10k-tokenized")
 DATA_CACHE_DIR = Path("data/fineweb-100k-tokenized")
-THOUGHT_MAX_TOKENS = 128
+THOUGHT_MAX_TOKENS = 1024
 THOUGHT_TOP_P = 0.95
 THOUGHT_TEMPERATURE = 0.7
-LR = 1e-5
+LR = 1e-6
 TAU = 0.999                            # EMA decay
 EPS_CLIP_LOW, EPS_CLIP_HIGH = 0.1, 0.1 # PPO clipping
 NUM_EPOCHS = 1
@@ -121,6 +124,7 @@ if tokenizer.pad_token is None:
 special_tokens = {"additional_special_tokens": ["<think>", "</think>"]}
 added_tokens = tokenizer.add_special_tokens(special_tokens)
 
+SAVE_MODEL_INTERVAL = 1000
 model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, trust_remote_code=True).to(DEVICE)
 if added_tokens > 0:
     model.resize_token_embeddings(len(tokenizer))
@@ -189,6 +193,34 @@ def collate_fn(batch):
 dataset = build_dataset()
 loader = DataLoader(dataset.shuffle(seed=42), batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
 
+# Metric tracking for visualization
+reward_history = []
+cot_length_history = []
+loss_history = []
+step_history = []
+
+PLOT_SAVE_INTERVAL = 100
+METRIC_FIG_PATH = Path("grlp_training_metrics.png")
+
+def save_metric_plot():
+    if not reward_history:
+        return
+    fig, axes = plt.subplots(3, 1, figsize=(8, 8), sharex=True)
+    axes[0].plot(step_history, reward_history, color="tab:blue")
+    axes[0].set_ylabel("Avg Reward")
+    axes[0].grid(alpha=0.3)
+    axes[1].plot(step_history, cot_length_history, color="tab:orange")
+    axes[1].set_ylabel("Avg CoT Tokens")
+    axes[1].grid(alpha=0.3)
+    axes[2].plot(step_history, loss_history, color="tab:green")
+    axes[2].set_ylabel("Loss")
+    axes[2].set_xlabel("Global Step")
+    axes[2].grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(METRIC_FIG_PATH, bbox_inches="tight")
+    plt.close(fig)
+
+
 # -----------------------------
 # Training loop
 # -----------------------------
@@ -240,6 +272,7 @@ for epoch in range(NUM_EPOCHS):
         reasoned_prefix_lengths = []
         gold_lengths_expanded = []
         thoughts_per_sample = []
+        batch_rewards = []
 
         start_marker = start_thought_id
         end_marker = end_thought_id
@@ -364,6 +397,7 @@ for epoch in range(NUM_EPOCHS):
                 delta = reasoned_logps[idx].float() - baseline_lp
                 reward = torch.dot(discount, delta.float())
                 rewards.append(reward)
+                batch_rewards.append(float(reward.cpu()))
             rewards_tensor = torch.stack(rewards)
             if rewards_tensor.size(0) > 1:
                 scale = rewards_tensor.size(0) / (rewards_tensor.size(0) - 1)
@@ -396,13 +430,35 @@ for epoch in range(NUM_EPOCHS):
         scaler.step(optimizer)
         scaler.update()
 
+        avg_reward_value = float(sum(batch_rewards) / len(batch_rewards)) if batch_rewards else None
+        avg_cot_length_value = float(sum(thought_token_lengths) / len(thought_token_lengths)) if thought_token_lengths else None
+        loss_value = float(total_loss.detach().cpu())
+
         # EMA update
         with torch.no_grad():
             for p_ema, p in zip(ema_model.parameters(), model.parameters()):
                 p_ema.data.mul_(TAU).add_(p.data, alpha=1.0 - TAU)
 
         global_step += 1
-        loop.set_postfix({"loss": float(total_loss.detach().cpu()), "step": global_step})
+        postfix = {"loss": loss_value, "step": global_step}
+        if avg_reward_value is not None:
+            postfix["avg_reward"] = avg_reward_value
+        if avg_cot_length_value is not None:
+            postfix["avg_cot_len"] = avg_cot_length_value
+        loop.set_postfix(postfix)
+
+        if avg_reward_value is not None and avg_cot_length_value is not None:
+            reward_history.append(avg_reward_value)
+            cot_length_history.append(avg_cot_length_value)
+            loss_history.append(loss_value)
+            step_history.append(global_step)
+            if global_step % PLOT_SAVE_INTERVAL == 0:
+                save_metric_plot()
+
+        if global_step % SAVE_MODEL_INTERVAL == SAVE_MODEL_INTERVAL - 1:
+            save_dir = f"{MODEL_NAME.split('/')[-1]}-grlp-epoch{epoch}-step{global_step}"
+            model.save_pretrained(save_dir)
+            tokenizer.save_pretrained(save_dir)
 
     # optional: save checkpoint each epoch
     save_dir = f"{MODEL_NAME.split('/')[-1]}-grlp-epoch{epoch}"

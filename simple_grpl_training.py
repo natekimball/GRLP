@@ -33,11 +33,11 @@ DATASET = "HuggingFaceFW/fineweb"
 SPLIT = "train"
 DATA_CACHE_DIR = Path("data/fineweb-100-tokenized")
 MAX_SEQ_LEN = 2048
-HORIZON = 32                          # reward horizon T (small for debug; paper uses long)
-G = 4                                  # number of rollouts per context
-GAMMA = 0.9                            # discount factor
+HORIZON = 8                          # reward horizon T (small for debug; paper uses long)
+G = 16                                  # number of rollouts per context
+GAMMA = 0.7                            # discount factor
 BATCH_SIZE = 1                         # token-level RLP is expensive; tune for your memory
-LR = 1e-5
+LR = 1e-6
 TAU = 0.999                            # EMA decay
 EPS_CLIP_LOW, EPS_CLIP_HIGH = 0.1, 0.1 # PPO clipping
 NUM_EPOCHS = 1
@@ -257,6 +257,7 @@ for epoch in range(NUM_EPOCHS):
                 # compute per-token logprob of cot_tokens under theta_old (behavior). We'll need these to form log pi_old per token.
                 # For that, compute logits of theta_old over cot_tokens autoregressively conditioned on prefix.
                 with torch.no_grad():
+                    # TODO: add </think> to the cot here and in logprobs new
                     # we want the logprob of each token in cot_tokens (teacher forcing style)
                     # logits where position j predicts next token j+1; probabilities for cot token u are at logits indices P+u-1
                     per_token_logp_old = compute_teacher_forced_logprobs(theta_old_model, generated, cot_tokens)  # (C,)

@@ -34,8 +34,8 @@ SPLIT = "train"
 DATA_CACHE_DIR = Path("data/fineweb-10k-tokenized")
 MAX_SEQ_LEN = 2048
 HORIZON = 8                          # reward horizon T (small for debug; paper uses long)
-THOUGHT_MAX_TOKENS = 1024
-G = 16                                  # number of rollouts per context
+THOUGHT_MAX_TOKENS = 128
+G = 8                                  # number of rollouts per context
 GAMMA = 0.7                            # discount factor
 BATCH_SIZE = 1                         # token-level RLP is expensive; tune for your memory
 LR = 1e-6
@@ -245,15 +245,16 @@ for epoch in range(NUM_EPOCHS):
                     eos_token_id=[tokenizer.eos_token_id, end_thought_id.item()],
                     pad_token_id=tokenizer.pad_token_id,
                 )
-                # generated contains prefix + cot + maybe EOS; remove the prefix part to get only cot tokens
+                # TODO: add </think> to the cot here and in logprobs new
+                if generated[0, -1] == tokenizer.eos_token_id:
+                    generated[0, -1] = end_thought_id.item()
+                elif generated[0, -1] != end_thought_id.item():
+                    # append </think>
+                    generated = torch.cat([generated, end_thought_id], dim=1)
+
+                # generated contains prefix + cot; remove the prefix part to get only cot tokens
                 cot_tokens = generated[:, P:]  # shape (1, C)
                 log_sampled_thought(global_step, epoch, t, gidx, cot_tokens.squeeze(0))
-                # TODO: add </think> to the cot here and in logprobs new
-                if cot_tokens[0, -1] == tokenizer.eos_token_id:
-                    cot_tokens[0, -1] = end_thought_id.item()
-                elif cot_tokens[0, -1] != end_thought_id.item():
-                    # append </think>
-                    cot_tokens = torch.cat([cot_tokens, end_thought_id], dim=1)
 
                 # TODO: add back and change G in normalization later if error experienced
                 # if cot_tokens.size(1) <= 1:

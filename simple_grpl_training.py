@@ -144,11 +144,13 @@ start_thought_id = tokenizer("<think>", return_tensors="pt").input_ids.to(DEVICE
 end_thought_id = tokenizer("</think>", return_tensors="pt").input_ids.to(DEVICE)
 
 
-def log_sampled_thought(step_idx: int, epoch_idx: int, position: int, rollout_idx: int, token_ids: torch.Tensor) -> None:
+def log_sampled_thought(step_idx: int, epoch_idx: int, position: int, rollout_idx: int, cot_tokens: torch.Tensor, prefix: str, target: str) -> None:
     """Append the decoded chain-of-thought sample to the debug log."""
-    decoded = tokenizer.decode(token_ids.tolist(), skip_special_tokens=False)
+    decoded = tokenizer.decode(cot_tokens.tolist(), skip_special_tokens=False)
     with DEBUG_LOG_PATH.open("a", encoding="utf-8") as log_file:
-        log_file.write(f"[step={step_idx} epoch={epoch_idx} t={position} rollout={rollout_idx}]\n")
+        log_file.write(f"[step={step_idx} epoch={epoch_idx} t={position} rollout={rollout_idx} len={cot_tokens.size(1)}]\n")
+        log_file.write(f"Prefix: {prefix}\n")
+        log_file.write(f"Target: {target}\n")
         log_file.write(repr(decoded) + "\n\n")
 
 
@@ -215,6 +217,9 @@ for epoch in range(NUM_EPOCHS):
             P = prefix.size(1)
             H_current = gold_window.size(1)
 
+            prefix_str = tokenizer.decode(prefix[:, -2*H_current:].squeeze(0).tolist())
+            target_str = tokenizer.decode(gold_window.squeeze(0).tolist())
+
             # compute s_ema per token under EMA model (no-think baseline)
             with torch.no_grad():
                 # EMA input: prefix + gold_window
@@ -254,7 +259,7 @@ for epoch in range(NUM_EPOCHS):
 
                 # generated contains prefix + cot; remove the prefix part to get only cot tokens
                 cot_tokens = generated[:, P:]  # shape (1, C)
-                log_sampled_thought(global_step, epoch, t, gidx, cot_tokens.squeeze(0))
+                log_sampled_thought(global_step, epoch, t, gidx, cot_tokens.squeeze(0), prefix_str, target_str)
 
                 # TODO: add back and change G in normalization later if error experienced
                 # if cot_tokens.size(1) <= 1:
@@ -264,18 +269,18 @@ for epoch in range(NUM_EPOCHS):
                 rollouts_ct.append(cot_tokens)
                 batch_cot_lengths.append(int(cot_tokens.size(1)))
 
-                # compute per-token logprobs of the thought tokens under current model (for policy)
-                # For that, compute logits of theta_old over cot_tokens autoregressively conditioned on prefix.
-                # Remove torch.no_grad() here since we need gradients for the policy loss
-                per_token_logp_new = compute_teacher_forced_logprobs(model, generated, cot_tokens)  # (C,)
-                per_rollout_thought_logprobs_new.append(per_token_logp_new)  # (C,)
-
                 # compute per-token logprob of cot_tokens under theta_old (behavior). We'll need these to form log pi_old per token.
                 with torch.no_grad():
                     # we want the logprob of each token in cot_tokens (teacher forcing style)
                     # logits where position j predicts next token j+1; probabilities for cot token u are at logits indices P+u-1
                     per_token_logp_old = compute_teacher_forced_logprobs(theta_old_model, generated, cot_tokens)  # (C,)
                     per_rollout_thought_logprobs_old.append(per_token_logp_old.detach())
+
+                # compute per-token logprobs of the thought tokens under current model (for policy)
+                # For that, compute logits of theta_old over cot_tokens autoregressively conditioned on prefix.
+                # Remove torch.no_grad() here since we need gradients for the policy loss
+                per_token_logp_new = compute_teacher_forced_logprobs(model, generated, cot_tokens)  # (C,)
+                per_rollout_thought_logprobs_new.append(per_token_logp_new)  # (C,)
 
             # Now for each rollout evaluate the reasoned per-token log-probs under the current model (p_theta)
             returns = []  # discounted returns R(c_t) for each rollout

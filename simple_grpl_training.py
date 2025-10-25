@@ -227,7 +227,7 @@ def log_sampled_thought(step_idx: int, epoch_idx: int, position: int, rollout_id
     """Append the decoded chain-of-thought sample to the debug log."""
     decoded = tokenizer.decode(cot_tokens.tolist(), skip_special_tokens=False)
     with DEBUG_LOG_PATH.open("a", encoding="utf-8") as log_file:
-        log_file.write(f"[step={step_idx} epoch={epoch_idx} t={position} rollout={rollout_idx} len={cot_tokens.size(1)}]\n")
+        log_file.write(f"[step={step_idx} epoch={epoch_idx} t={position} rollout={rollout_idx} len={cot_tokens.size(0)}]\n")
         log_file.write(f"Prefix: {prefix}\n")
         log_file.write(f"Target: {target}\n")
         log_file.write(repr(decoded) + "\n\n")
@@ -292,8 +292,8 @@ for epoch in range(NUM_EPOCHS):
         full_input_ids = torch.tensor(item["input_ids"], dtype=torch.long).unsqueeze(0).to(DEVICE)  # (1, L)
         L = full_input_ids.size(1)
         # choose some positions t to apply RLP on in this example: for fast debug pick a few
-        # In large runs you'd iterate t across the sequence (possibly sampled)
-        candidate_positions = list(range(1, max(2, min(L - HORIZON - 1, 8))))  # up to 8 pos or less
+        # In large runs you'd iterate t across the sequence
+        candidate_positions = torch.randint(1, max(2, L - HORIZON - 1), (min(8, L - HORIZON - 1),)).tolist()
         if len(candidate_positions) == 0:
             continue
 
@@ -369,10 +369,12 @@ for epoch in range(NUM_EPOCHS):
                     )
 
                 r_per_token = s_pred_per_token - s_ema_per_token.to(s_pred_per_token.device)
-                discount_base = torch.full((H_current,), GAMMA, device=r_per_token.device, dtype=r_per_token.dtype)
-                exponents = torch.arange(H_current, device=r_per_token.device, dtype=r_per_token.dtype)
-                discounts = torch.pow(discount_base, exponents)
-                R = torch.dot(r_per_token, discounts)
+                # discount_base = torch.full((H_current,), GAMMA, device=r_per_token.device, dtype=r_per_token.dtype)
+                # exponents = torch.arange(H_current, device=r_per_token.device, dtype=r_per_token.dtype)
+                # discounts = torch.pow(discount_base, exponents)
+                # R = torch.dot(r_per_token, discounts)
+                discounted = torch.stack([r_per_token[k] * (GAMMA ** k) for k in range(H_current)])
+                R = discounted.sum()
                 returns.append(R.detach())
                 batch_rewards.append(float(R.detach().cpu()))
 
@@ -390,10 +392,13 @@ for epoch in range(NUM_EPOCHS):
             for adv, rollout_info in zip(advantages, rollout_infos):
                 cot_tokens = rollout_info["cot_tokens"].to(DEVICE)
                 logp_old = rollout_info["logp_old"].to(device=cot_tokens.device, dtype=torch.float32)
-                logp_new, _, _ = compute_sequence_logprobs_with_cache(
-                    model, cot_tokens, model_prefix_past, model_prefix_mask
-                )
+                policy_input = torch.cat([prefix, cot_tokens], dim=1)
+                # removed cache here to reduce memory usage
+                # logp_new, _, _ = compute_sequence_logprobs_with_cache(
+                #     model, cot_tokens, model_prefix_past, model_prefix_mask
+                # )
                 logp_new = logp_new.to(torch.float32)
+                logp_new = compute_teacher_forced_logprobs(model, policy_input, cot_tokens).to(torch.float32)
                 log_rhos = logp_new - logp_old
                 rhos = torch.exp(log_rhos)
                 clip_rhos = torch.clamp(rhos, 1.0 - EPS_CLIP_LOW, 1.0 + EPS_CLIP_HIGH)

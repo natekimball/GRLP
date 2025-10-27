@@ -1,213 +1,518 @@
-import copy
+from __future__ import annotations
+
+import random
+from copy import deepcopy
+from typing import Optional, Dict, Any, List
+
 import torch
-import torch.nn.functional as F
+from torch.optim import AdamW
 from torch.utils.data import DataLoader
-from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
-from tqdm import tqdm
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
-model_name = "Qwen/Qwen3-0.6B-Base"
-dataset_name = "HuggingFaceFW/fineweb"
-split="train"
-max_length = 2048
-batch_size = 1
-lr = 1e-5
-tau = 0.999
-eps_clip = (0.1, 0.1)
-num_epochs = 1
-G = 4
-thought_max_tokens = 128
-temperature = 0.7
-top_p = 0.9
-device = "cuda" if torch.cuda.is_available() else "cpu"
+MODEL_NAME = "Qwen/Qwen3-0.6B-Base"
 
 
-tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-if tokenizer.pad_token is None:
-    tokenizer.pad_token = tokenizer.eos_token
-special_tokens = {"additional_special_tokens": ["<think>", "</think>"]}
-added = tokenizer.add_special_tokens(special_tokens)
-model = AutoModelForCausalLM.from_pretrained(model_name, trust_remote_code=True).to(device)
-if added > 0:
-    model.resize_token_embeddings(len(tokenizer))
-ema_model = copy.deepcopy(model).to(device)
-for p in ema_model.parameters():
-    p.requires_grad = False
-model.config.pad_token_id = tokenizer.pad_token_id
-ema_model.config.pad_token_id = tokenizer.pad_token_id
-ema_model.eval()
+DTYPE = "bfloat16"
 
-start_thought_id = tokenizer("<think>", return_tensors="pt").input_ids.to(device)
-end_thought_id = tokenizer("</think>", return_tensors="pt").input_ids.to(device)
 
-def tokenize_fn(batch):
-    tokens = tokenizer(
-        batch["text"],
-        truncation=True,
-        max_length=max_length,
-        padding="max_length",
-        return_attention_mask=True,
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+LR = 1e-6
+BATCH_SIZE_PROMPTS = 8
+MAX_CONTEXT_LEN = 1024
+
+NUM_ROLLOUTS = 16
+TEMPERATURE = 0.7
+TOP_P = 0.95
+THOUGHT_MAX_NEW_TOKENS = 64
+MIN_NEW_TOKENS = 1
+
+CLIP_EPS_LOW = 0.2
+CLIP_EPS_HIGH = 0.2
+GRAD_CLIP_NORM = 1.0
+
+MAX_STEPS = 100
+GRAD_ACCUM_STEPS = 1
+LOG_EVERY = 10
+
+EMA_TAU = 0.999
+EMA_LAZY_INIT = True
+EMA_TEACHER: Optional[torch.nn.Module] = None
+
+
+DATASET_PATH = "HuggingFaceFW/fineweb"
+DATASET_NAME = None
+SPLIT = "train"
+STREAMING = True
+N_SAMPLES = 1024
+TEXT_COLUMN = "text"
+
+
+K_POSITIONS = 4
+POSITION_STRATEGY = "surprising"
+POSITION_STRIDE = 64
+
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+from contextlib import contextmanager
+
+@contextmanager
+def set_use_cache(m, flag: bool):
+    prev = getattr(m.config, "use_cache", False)
+    m.config.use_cache = flag
+    try:
+        yield
+    finally:
+        m.config.use_cache = prev
+
+def load_model_and_tokenizer():
+    tok = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+
+    dtype = torch.bfloat16 if DTYPE == "bfloat16" else torch.float16
+
+    model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=dtype)
+    model.config.use_cache = False
+    try:
+        model.gradient_checkpointing_enable()
+    except Exception:
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
+        model.gradient_checkpointing_enable()
+
+    model.to(DEVICE)
+    model.train()
+    return model, tok
+
+
+def ema_maybe_init(student: torch.nn.Module):
+    global EMA_TEACHER
+    if EMA_TEACHER is None:
+        EMA_TEACHER = deepcopy(student).eval()
+        for p in EMA_TEACHER.parameters():
+            p.requires_grad_(False)
+
+
+@torch.no_grad()
+def ema_update(student: torch.nn.Module, tau: float = EMA_TAU):
+    global EMA_TEACHER
+    if EMA_TEACHER is None:
+        ema_maybe_init(student)
+    for p_t, p_s in zip(EMA_TEACHER.parameters(), student.parameters()):
+        p_t.data.mul_(tau).add_(p_s.data, alpha=1.0 - tau)
+    for b_t, b_s in zip(EMA_TEACHER.buffers(), student.buffers()):
+        b_t.copy_(b_s)
+
+
+def make_behavior_snapshot(student: torch.nn.Module) -> torch.nn.Module:
+    with torch.no_grad():
+        snap = deepcopy(student)
+        snap.eval()
+        if hasattr(snap, "config"):
+            snap.config.use_cache = True
+        for p in snap.parameters():
+            p.requires_grad_(False)
+        return snap
+
+
+
+def iter_fineweb_first_n(
+    n: int,
+    tokenizer,
+    batch_size: int = BATCH_SIZE_PROMPTS,
+    max_len: int = MAX_CONTEXT_LEN,
+):
+    ds = load_dataset(
+        DATASET_PATH, name=DATASET_NAME, split=SPLIT, streaming=STREAMING
+    ).take(n)
+
+    def get_text(row: Dict[str, Any]):
+        if TEXT_COLUMN is not None and TEXT_COLUMN in row:
+            return row[TEXT_COLUMN]
+        for key in ("text", "content", "raw_content", "document", "body"):
+            if key in row:
+                return row[key]
+        strings = [v for v in row.values() if isinstance(v, str)]
+        return max(strings, key=len) if strings else None
+
+    def encode(ex: Dict[str, Any]):
+        txt = get_text(ex)
+        if not txt:
+            return {"skip": True}
+        enc = tokenizer(
+            txt,
+            max_length=max_len,
+            truncation=True,
+            padding="max_length",
+        )
+        ids = enc["input_ids"]
+        mask = enc["attention_mask"]
+        if tokenizer.eos_token_id is not None and len(ids) == max_len:
+            ids[-1] = tokenizer.eos_token_id
+        return {"input_ids": ids, "attention_mask": mask}
+
+    tokenized = ds.map(encode)
+
+    def collate(batch):
+        batch = [b for b in batch if "input_ids" in b]
+        input_ids = torch.tensor([b["input_ids"] for b in batch], dtype=torch.long)
+        attention_mask = torch.tensor(
+            [b["attention_mask"] for b in batch], dtype=torch.long
+        )
+        return {"input_ids": input_ids, "attention_mask": attention_mask}
+
+    loader = DataLoader(
+        tokenized,
+        batch_size=batch_size,
+        collate_fn=collate,
+        num_workers=0,
+        pin_memory=torch.cuda.is_available(),
     )
-    return tokens
+    return loader
+
+def _positions_from_mask_random(mask: torch.Tensor, k: int) -> List[int]:
+    valid_len = int(mask.sum().item())
+    if valid_len < 2:
+        return []
+    cand = list(range(1, valid_len))
+    return random.sample(cand, min(k, len(cand)))
 
 
-ds = load_dataset(dataset_name, split=split, streaming=True)
-ds = ds.map(tokenize_fn, batched=True, remove_columns=ds.column_names)
-loader = DataLoader(ds, batch_size=batch_size)
+def _positions_from_mask_stride(mask: torch.Tensor, stride: int) -> List[int]:
+    valid_len = int(mask.sum().item())
+    if valid_len < 2:
+        return []
+    return list(range(1, valid_len, max(1, stride)))
 
 
-def ema_update(ema_module, src_module, decay):
-    for p_ema, p in zip(ema_module.parameters(), src_module.parameters()):
-        p_ema.data.mul_(decay).add_(p.data, alpha=1.0 - decay)
-
-
-def gather_token_logprobs(model_ref, prefix, suffix):
-    combined = torch.cat([prefix, suffix], dim=1)
-    outputs = model_ref(input_ids=combined)
-    logits = outputs.logits[:, :-1, :]
-    log_probs = F.log_softmax(logits, dim=-1)
-    next_tokens = combined[:, 1:].unsqueeze(-1)
-    token_log_probs = torch.gather(log_probs, dim=-1, index=next_tokens).squeeze(-1)
-    prefix_len = prefix.size(1)
-    suffix_len = suffix.size(1)
-    start_idx = prefix_len - 1 if prefix_len > 0 else 0
-    return token_log_probs[:, start_idx : start_idx + suffix_len]
-
-
-def next_token_logprob(model_ref, prefix, target_token):
-    logp = gather_token_logprobs(model_ref, prefix, target_token)
-    return logp.squeeze(0).squeeze(0)
-
-
-def old_token_logprobs(model_ref, prefix, suffix):
-    was_training = model_ref.training
-    model_ref.eval()
-    with torch.no_grad():
-        logp = gather_token_logprobs(model_ref, prefix, suffix)
+@torch.no_grad()
+def _ema_next_token_logprobs_all(ema_model, ids: torch.Tensor, mask: torch.Tensor) -> List[float]:
+    device = next(ema_model.parameters()).device
+    valid_len = int(mask.sum().item())
+    if valid_len < 2:
+        return []
+    seq = ids[:valid_len].unsqueeze(0).to(device)
+    was_training = ema_model.training
+    ema_model.eval()
+    with set_use_cache(ema_model, False):
+        out = ema_model(input_ids=seq)
+        logits = out.logits[:, : valid_len - 1, :]
+        targets = seq[:, 1:valid_len]
+        logp = torch.log_softmax(logits, dim=-1)
+        lp = logp.gather(2, targets.unsqueeze(-1)).squeeze(-1)
     if was_training:
-        model_ref.train()
-    return logp
+        ema_model.train()
+    return lp[0].tolist()
 
 
-def old_next_token_logprob(model_ref, prefix, target_token):
-    was_training = model_ref.training
-    model_ref.eval()
-    with torch.no_grad():
-        logp = next_token_logprob(model_ref, prefix, target_token)
-    if was_training:
-        model_ref.train()
-    return logp
+def _positions_from_mask_surprising(
+    ema_model, ids: torch.Tensor, mask: torch.Tensor, k: int
+) -> List[int]:
+    lp = _ema_next_token_logprobs_all(ema_model, ids, mask)
+    if not lp:
+        return []
+    lpt = torch.tensor(lp)
+    k = min(k, lpt.numel())
+    idx = torch.topk(lpt, k=k, largest=False).indices.tolist()
+    return [int(u) + 1 for u in idx]
 
+@torch.no_grad()
+def _logprob_next_token(
+    model, input_ids: List[int], next_token_id: int, stable_eval: bool = True
+) -> float:
+    device = next(model.parameters()).device
+    was_training = model.training
+    if stable_eval:
+        model.eval()
+    x = torch.tensor([input_ids], dtype=torch.long, device=device)
+    # enable cache briefly; tiny sequence here
+    with set_use_cache(model, True):
+        out = model(input_ids=x)
+        logp = torch.log_softmax(out.logits[:, -1, :], dim=-1)
+    if stable_eval and was_training:
+        model.train()
+    return float(logp[0, next_token_id].item())
 
-def sample_thought(model_ref, prefix_tokens):
-    was_training = model_ref.training
-    model_ref.eval()
-    with torch.no_grad():
-        generated = model_ref.generate(
-            prefix_tokens,
-            max_new_tokens=thought_max_tokens,
+@torch.no_grad()
+def _sample_thought_ids_for_prefix(
+    model, tokenizer, prefix_ids: List[int], max_new_tokens: int = THOUGHT_MAX_NEW_TOKENS
+) -> List[int]:
+    device = next(model.parameters()).device
+    inp = torch.tensor([prefix_ids], dtype=torch.long, device=device)
+    with set_use_cache(model, True):
+        was_training = model.training
+        model.eval()
+        gen = model.generate(
+            inp,
             do_sample=True,
-            temperature=temperature,
-            top_p=top_p,
-            pad_token_id=tokenizer.pad_token_id,
+            temperature=TEMPERATURE,
+            top_p=TOP_P,
+            max_new_tokens=max_new_tokens,
+            min_new_tokens=MIN_NEW_TOKENS,
+            pad_token_id=tokenizer.eos_token_id,
             eos_token_id=tokenizer.eos_token_id,
         )
-    if was_training:
-        model_ref.train()
-    continuation = generated[:, prefix_tokens.size(1) :]
-    if continuation.size(1) == 0:
-        continuation = torch.tensor([[tokenizer.eos_token_id]], device=device)
-    row = continuation[0]
-    valid = row[row != tokenizer.pad_token_id]
-    if valid.size(0) == 0:
-        valid = torch.tensor([tokenizer.eos_token_id], device=device)
-    if valid[-1].item() == tokenizer.eos_token_id:
-        valid = valid[:-1] if valid.size(0) > 1 else valid
-    valid = valid[:thought_max_tokens]
-    if valid.size(0) == 0:
-        valid = torch.tensor([tokenizer.eos_token_id], device=device)
-    return valid.unsqueeze(0)
+        if was_training:
+            model.train()
+    thought = gen[0, inp.shape[1]:].tolist()
+    eos = tokenizer.eos_token_id
+    if eos in thought:
+        thought = thought[: thought.index(eos)]
+    if len(thought) == 0:
+        with set_use_cache(model, True):
+            was_training = model.training
+            model.eval()
+            gen2 = model.generate(
+                inp,
+                do_sample=True,
+                top_p=TOP_P,
+                temperature=TEMPERATURE,
+                max_new_tokens=1,
+                pad_token_id=eos,
+                eos_token_id=None,
+            )
+            if was_training:
+                model.train()
+        thought = gen2[0, inp.shape[1]:].tolist() or [inp[0, -1].item()]
+    return thought
+
+@torch.no_grad()
+def _sample_thought_and_logprobs(
+    model,
+    tokenizer,
+    prefix_ids: List[int],
+    max_new_tokens: int = THOUGHT_MAX_NEW_TOKENS,
+):
+    device = next(model.parameters()).device
+    inp = torch.tensor([prefix_ids], dtype=torch.long, device=device)
+
+    with set_use_cache(model, True):
+        was_training = model.training
+        model.eval()
+        out = model.generate(
+            inp,
+            do_sample=True,
+            temperature=TEMPERATURE,
+            top_p=TOP_P,
+            max_new_tokens=max_new_tokens,
+            min_new_tokens=MIN_NEW_TOKENS,
+            pad_token_id=tokenizer.eos_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+            return_dict_in_generate=True,
+            output_scores=True,
+        )
+        if was_training:
+            model.train()
+
+    full_seq = out.sequences[0]
+    gen_ids = full_seq[inp.shape[1]:].tolist()
+    scores = out.scores  # list[time] of (batch, vocab)
+
+    old_logprobs: List[float] = []
+    for t, logits in enumerate(scores):
+        tok_id = int(full_seq[inp.shape[1] + t].item())
+        lp = torch.log_softmax(logits, dim=-1)[0, tok_id]
+        old_logprobs.append(float(lp.item()))
+
+    eos = tokenizer.eos_token_id
+    if eos in gen_ids:
+        stop = gen_ids.index(eos)
+        gen_ids = gen_ids[:stop]
+        old_logprobs = old_logprobs[:stop]
+
+    if len(gen_ids) == 0:
+        with set_use_cache(model, True):
+            was_training = model.training
+            model.eval()
+            out2 = model.generate(
+                inp,
+                do_sample=True,
+                top_p=TOP_P,
+                temperature=TEMPERATURE,
+                max_new_tokens=1,
+                pad_token_id=eos,
+                eos_token_id=None,
+                return_dict_in_generate=True,
+                output_scores=True,
+            )
+            if was_training:
+                model.train()
+
+        full_seq2 = out2.sequences[0]
+        gen_ids = full_seq2[inp.shape[1]:].tolist()
+        logits = out2.scores[0]
+        tok_id = int(full_seq2[inp.shape[1]].item())
+        lp = torch.log_softmax(logits, dim=-1)[0, tok_id]
+        old_logprobs = [float(lp.item())]
+
+    return gen_ids, old_logprobs
 
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
-model.train()
+
+def _thought_token_logprobs(model, prefix_ids: List[int], thought_ids: List[int], require_grad: bool) -> torch.Tensor:
+    device = next(model.parameters()).device
+    seq = torch.tensor([prefix_ids + thought_ids], dtype=torch.long, device=device)
+    prefix_len = len(prefix_ids)
+    if require_grad:
+        out = model(input_ids=seq)
+        logits = out.logits[:, prefix_len - 1 : -1, :]
+        logp = torch.log_softmax(logits, dim=-1)[0]
+        idx = torch.tensor(thought_ids, dtype=torch.long, device=device)
+        return logp.gather(1, idx.view(-1, 1)).squeeze(1)
+    else:
+        with torch.no_grad():
+            out = model(input_ids=seq)
+            logits = out.logits[:, prefix_len - 1 : -1, :]
+            logp = torch.log_softmax(logits, dim=-1)[0]
+            idx = torch.tensor(thought_ids, dtype=torch.long, device=device)
+            return logp.gather(1, idx.view(-1, 1)).squeeze(1).detach()
 
 
-for epoch in range(num_epochs):
-    progress = tqdm(loader, desc=f"epoch {epoch}")
-    for batch in progress:
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        valid_len = attention_mask.sum(dim=1).long()
-        if valid_len.min().item() <= 2:
-            continue
-        prefix_lengths = []
-        for length in valid_len:
-            prefix_lengths.append(torch.randint(1, length.item() - 1, (1,), device=device).item())
-        total_rewards = []
-        thought_contexts = []
-        thought_tokens = []
-        old_logps = []
 
-        for b_idx in range(input_ids.size(0)):
-            prefix_end = prefix_lengths[b_idx]
-            prefix = input_ids[b_idx : b_idx + 1, :prefix_end]
-            target_token = input_ids[b_idx : b_idx + 1, prefix_end : prefix_end + 1]
-            thought_prefix = torch.cat([prefix, start_thought_id], dim=1)
+def _clipped_surrogate_term(
+    logp_cur: torch.Tensor,
+    logp_old: torch.Tensor,
+    advantage: torch.Tensor,
+    eps_low: float,
+    eps_high: float,
+) -> torch.Tensor:
+    A = advantage.detach()
+    rho = torch.exp(logp_cur - logp_old)
+    rho_clip = torch.clamp(rho, 1.0 - eps_low, 1.0 + eps_high)
+    left = rho * A
+    right = rho_clip * A
+    token_terms = -torch.minimum(left, right)
+    return token_terms.mean()
+def train_loop(model, tokenizer):
+    optimizer = AdamW(model.parameters(), lr=LR)
 
-            baseline_logp = old_next_token_logprob(ema_model, prefix, target_token)
+    global EMA_TEACHER
 
-            rewards = []
-            collected_tokens = []
-            collected_prefixes = []
-            collected_old_logps = []
+    for step in range(1, MAX_STEPS + 1):
+        loader = iter_fineweb_first_n(
+            N_SAMPLES, tokenizer, BATCH_SIZE_PROMPTS, MAX_CONTEXT_LEN
+        )
 
-            for _ in range(G):
-                sampled = sample_thought(model, thought_prefix)
-                thought = torch.cat([sampled, end_thought_id], dim=1)
-                prefix_for_gradient = thought_prefix
-                collected_tokens.append(thought)
-                collected_prefixes.append(prefix_for_gradient)
-                old_logp = old_token_logprobs(model, prefix_for_gradient, thought)
-                reasoned_prefix = torch.cat([prefix_for_gradient, thought], dim=1)
-                reasoned_logp = old_next_token_logprob(model, reasoned_prefix, target_token)
-                reward = (reasoned_logp - baseline_logp).detach()
-                collected_old_logps.append(old_logp.detach())
-                rewards.append(reward)
+        for batch_idx, batch in enumerate(loader):
+            if EMA_LAZY_INIT and EMA_TEACHER is None:
+                ema_maybe_init(model)
 
-            rewards_tensor = torch.stack(rewards)
-            mean_reward = rewards_tensor.mean()
-            advantages = (G / (G - 1)) * (rewards_tensor - mean_reward)
+            device = next(model.parameters()).device
+            input_ids = batch["input_ids"].to(device, non_blocking=True)
+            attention_mask = batch["attention_mask"].to(device, non_blocking=True)
 
-            for idx in range(G):
-                thought_tokens.append(collected_tokens[idx])
-                thought_contexts.append(collected_prefixes[idx])
-                old_logps.append(collected_old_logps[idx])
-                total_rewards.append(advantages[idx].detach())
+            optimizer.zero_grad(set_to_none=True)
+            num_terms = 0  # how many L_clip_i we actually backprop
 
-        if not thought_tokens:
-            continue
+            B = input_ids.shape[0]
+            G = NUM_ROLLOUTS
 
-        policy_losses = []
-        for idx, thought in enumerate(thought_tokens):
-            prefix_ctx = thought_contexts[idx]
-            new_logp = gather_token_logprobs(model, prefix_ctx, thought)
-            old_logp = old_logps[idx]
-            ratio = (new_logp - old_logp).exp()
-            clipped_ratio = torch.clamp(ratio, 1 - eps_clip[0], 1 + eps_clip[1])
-            advantage = total_rewards[idx]
-            policy_losses.append(-torch.min(ratio * advantage, clipped_ratio * advantage).mean())
+            for b in range(B):
+                ids_b = input_ids[b]
+                msk_b = attention_mask[b]
+                valid_len = int(msk_b.sum().item())
+                if valid_len < 2:
+                    continue
 
-        loss = torch.stack(policy_losses).mean()
+                if POSITION_STRATEGY == "random":
+                    pos_list = _positions_from_mask_random(msk_b, K_POSITIONS)
+                    ema_lp_all = None
+                elif POSITION_STRATEGY == "stride":
+                    pos_list = _positions_from_mask_stride(msk_b, POSITION_STRIDE)[:K_POSITIONS]
+                    ema_lp_all = None
+                else:  # "surprising"
+                    pos_list = _positions_from_mask_surprising(EMA_TEACHER, ids_b, msk_b, K_POSITIONS)
+                    ema_lp_all = (_ema_next_token_logprobs_all(EMA_TEACHER, ids_b, msk_b)
+                                  if pos_list else None)
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        ema_update(ema_model, model, tau)
+                if not pos_list:
+                    continue
 
-        progress.set_postfix({"loss": loss.item()})
+                max_prefix = max(1, MAX_CONTEXT_LEN - THOUGHT_MAX_NEW_TOKENS - 1)
+
+                S_ema_cache: Dict[int, float] = {}
+                if ema_lp_all is not None:
+                    for t in pos_list:
+                        S_ema_cache[t] = float(ema_lp_all[t - 1])
+
+                for t in pos_list:
+                    full_prefix_ids = ids_b[:t].tolist()
+                    next_tok = int(ids_b[t].item())
+
+                    prefix_ids = (
+                        full_prefix_ids[-max_prefix:]
+                        if len(full_prefix_ids) > max_prefix else full_prefix_ids
+                    )
+
+                    S_ema = S_ema_cache.get(
+                        t, _logprob_next_token(EMA_TEACHER, prefix_ids, next_tok)
+                    )
+
+                    r_list: List[float] = []
+                    thought_list: List[List[int]] = []
+                    old_lp_list: List[List[float]] = []
+
+                    for _ in range(G):
+                        thought_ids, old_logprobs = _sample_thought_and_logprobs(
+                            model, tokenizer, prefix_ids, 
+                        )
+                        S_pred = _logprob_next_token(model, prefix_ids + thought_ids, next_tok)
+                        r = S_pred - S_ema
+                        r_list.append(r)
+                        thought_list.append(thought_ids)
+                        old_lp_list.append(old_logprobs)
+
+                    r_tensor = torch.tensor(r_list, dtype=torch.float32, device=device)
+                    A_vec = (G / (G - 1.0)) * (r_tensor - r_tensor.mean())
+
+                    for i in range(G):
+                        thought_ids = thought_list[i]
+                        logp_cur = _thought_token_logprobs(
+                            model, prefix_ids, thought_ids, require_grad=True
+                        )
+                        logp_old = torch.tensor(
+                            old_lp_list[i],
+                            dtype = logp_cur.dtype,
+                            device = logp_cur.device,
+                        )
+                        L_clip_i = _clipped_surrogate_term(
+                            logp_cur,
+                            logp_old,
+                            A_vec[i],
+                            eps_low=CLIP_EPS_LOW,
+                            eps_high=CLIP_EPS_HIGH,
+                        )
 
 
-model.save_pretrained("qwen3-0.6B-rlp")
-tokenizer.save_pretrained("qwen3-0.6B-rlp")
+                        (L_clip_i / max(1, GRAD_ACCUM_STEPS)).backward()
+                        num_terms += 1
+
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+            if num_terms > 0:
+                for p in model.parameters():
+                    if p.grad is not None:
+                        p.grad.div_(max(1, num_terms))
+
+                torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
+                optimizer.step()
+                ema_update(model, tau=EMA_TAU)
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        if step % LOG_EVERY == 0:
+            print(
+                f"step={step} N={N_SAMPLES} G={NUM_ROLLOUTS} "
+                f"K={K_POSITIONS} strategy={POSITION_STRATEGY} device={DEVICE}"
+            )
+if __name__ == "__main__":
+    model, tokenizer = load_model_and_tokenizer()
+    print(f"Loaded {MODEL_NAME} on {DEVICE} (dtype={DTYPE})")
+    train_loop(model, tokenizer)

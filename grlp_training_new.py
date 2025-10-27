@@ -29,6 +29,10 @@ TOP_P = 0.95
 THOUGHT_MAX_NEW_TOKENS = 64
 MIN_NEW_TOKENS = 1
 
+# added discounted multitoken return configuration.
+RETURN_HORIZON = 32
+DISCOUNT_GAMMA = 0.95
+
 CLIP_EPS_LOW = 0.2
 CLIP_EPS_HIGH = 0.2
 GRAD_CLIP_NORM = 1.0
@@ -238,6 +242,47 @@ def _logprob_next_token(
         model.train()
     return float(logp[0, next_token_id].item())
 
+
+# added aggregate per token information gains with discountign
+def _discounted_return(rewards: List[float], gamma: float) -> float:
+    total = 0.0
+    factor = 1.0
+    for r in rewards:
+        total += factor * r
+        factor *= gamma
+    return float(total)
+
+# added evaluation reasoned predictor on future tokens after a thought rollout.
+@torch.no_grad()
+def _logprobs_future_tokens(
+    model,
+    prefix_ids: List[int],
+    thought_ids: List[int],
+    future_token_ids: List[int],
+    stable_eval: bool = True,
+) -> List[float]:
+    if not future_token_ids:
+        return []
+    device = next(model.parameters()).device
+    seq = torch.tensor([prefix_ids + thought_ids + future_token_ids], dtype=torch.long, device=device)
+    prefix_len = len(prefix_ids) + len(thought_ids)
+    was_training = model.training
+    if stable_eval:
+        model.eval()
+    with set_use_cache(model, True):
+        out = model(input_ids=seq)
+        logits = out.logits[:, : seq.shape[1] - 1, :]
+        targets = seq[:, 1:]
+        logp = torch.log_softmax(logits, dim=-1)
+        start = prefix_len - 1
+        end = start + len(future_token_ids)
+        logp_slice = logp[:, start:end, :]
+        target_slice = targets[:, start:start + len(future_token_ids)]
+        gathered = logp_slice.gather(2, target_slice.unsqueeze(-1)).squeeze(-1)
+    if stable_eval and was_training:
+        model.train()
+    return gathered[0].tolist()
+
 @torch.no_grad()
 def _sample_thought_ids_for_prefix(
     model, tokenizer, prefix_ids: List[int], max_new_tokens: int = THOUGHT_MAX_NEW_TOKENS
@@ -419,41 +464,48 @@ def train_loop(model, tokenizer):
                 if valid_len < 2:
                     continue
 
+                # added cache EMA token log evidence for horizon rewards.
+                ema_lp_all = _ema_next_token_logprobs_all(EMA_TEACHER, ids_b, msk_b)
+
                 if POSITION_STRATEGY == "random":
                     pos_list = _positions_from_mask_random(msk_b, K_POSITIONS)
-                    ema_lp_all = None
                 elif POSITION_STRATEGY == "stride":
                     pos_list = _positions_from_mask_stride(msk_b, POSITION_STRIDE)[:K_POSITIONS]
-                    ema_lp_all = None
                 else:  # "surprising"
-                    pos_list = _positions_from_mask_surprising(EMA_TEACHER, ids_b, msk_b, K_POSITIONS)
-                    ema_lp_all = (_ema_next_token_logprobs_all(EMA_TEACHER, ids_b, msk_b)
-                                  if pos_list else None)
+                    if not ema_lp_all:
+                        pos_list = []
+                    else:
+                        lp_tensor = torch.tensor(ema_lp_all)
+                        k_select = min(K_POSITIONS, lp_tensor.numel())
+                        if k_select == 0:
+                            pos_list = []
+                        else:
+                            idx = torch.topk(lp_tensor, k=k_select, largest=False).indices.tolist()
+                            pos_list = [int(u) + 1 for u in idx]
 
                 if not pos_list:
                     continue
 
                 max_prefix = max(1, MAX_CONTEXT_LEN - THOUGHT_MAX_NEW_TOKENS - 1)
 
-                S_ema_cache: Dict[int, float] = {}
-                if ema_lp_all is not None:
-                    for t in pos_list:
-                        S_ema_cache[t] = float(ema_lp_all[t - 1])
-
                 for t in pos_list:
                     full_prefix_ids = ids_b[:t].tolist()
-                    next_tok = int(ids_b[t].item())
 
                     prefix_ids = (
                         full_prefix_ids[-max_prefix:]
                         if len(full_prefix_ids) > max_prefix else full_prefix_ids
                     )
 
-                    S_ema = S_ema_cache.get(
-                        t, _logprob_next_token(EMA_TEACHER, prefix_ids, next_tok)
-                    )
+                    # added expanded reward horizon from single token to discounted window.
+                    horizon = min(RETURN_HORIZON, valid_len - t)
+                    if horizon <= 0:
+                        continue
 
-                    r_list: List[float] = []
+                    future_tokens = ids_b[t : t + horizon].tolist()
+                    # added using EMA baseline across the full return horizon.
+                    ema_future = [float(ema_lp_all[t - 1 + k]) for k in range(horizon)]
+
+                    return_list: List[float] = []
                     thought_list: List[List[int]] = []
                     old_lp_list: List[List[float]] = []
 
@@ -461,14 +513,25 @@ def train_loop(model, tokenizer):
                         thought_ids, old_logprobs = _sample_thought_and_logprobs(
                             model, tokenizer, prefix_ids, 
                         )
-                        S_pred = _logprob_next_token(model, prefix_ids + thought_ids, next_tok)
-                        r = S_pred - S_ema
-                        r_list.append(r)
+                        pred_future_lp = _logprobs_future_tokens(
+                            model,
+                            prefix_ids,
+                            thought_ids,
+                            future_tokens,
+                        )
+                        # added pertoken rewards cover future positions.
+                        rewards = [
+                            s_pred - s_ema
+                            for s_pred, s_ema in zip(pred_future_lp, ema_future)
+                        ]
+                        R_val = _discounted_return(rewards, DISCOUNT_GAMMA)
+                        return_list.append(R_val)
                         thought_list.append(thought_ids)
                         old_lp_list.append(old_logprobs)
 
-                    r_tensor = torch.tensor(r_list, dtype=torch.float32, device=device)
-                    A_vec = (G / (G - 1.0)) * (r_tensor - r_tensor.mean())
+                    # added advantages computed from discounted returns.
+                    returns_tensor = torch.tensor(return_list, dtype=torch.float32, device=device)
+                    A_vec = (G / (G - 1.0)) * (returns_tensor - returns_tensor.mean())
 
                     for i in range(G):
                         thought_ids = thought_list[i]

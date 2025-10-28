@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import random
+import statistics
 from copy import deepcopy
 from typing import Optional, Dict, Any, List
 
@@ -9,6 +10,7 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from tqdm.auto import tqdm
 
 
 MODEL_NAME = "Qwen/Qwen3-0.6B-Base"
@@ -54,6 +56,10 @@ K_POSITIONS = 4
 POSITION_STRATEGY = "surprising"
 POSITION_STRIDE = 64
 
+REWARD_PLOT_PATH = "reward_metrics.png"
+LOSS_PLOT_PATH = "loss_metrics.png"
+THOUGHT_PLOT_PATH = "thought_length_metrics.png"
+
 if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -68,6 +74,77 @@ def set_use_cache(m, flag: bool):
         yield
     finally:
         m.config.use_cache = prev
+
+
+def _save_reward_plot(steps: List[int], means: List[float], stds: List[float]) -> None:
+    if not steps:
+        return
+    try:
+        import matplotlib.pyplot as plt  # type: ignore[import-not-found]
+    except ImportError:
+        if not getattr(_save_reward_plot, "_warned", False):
+            print("matplotlib is required to plot reward metrics; skipping plot.")
+            _save_reward_plot._warned = True  # type: ignore[attr-defined]
+        return
+
+    lower = [m - s for m, s in zip(means, stds)]
+    upper = [m + s for m, s in zip(means, stds)]
+
+    plt.figure(figsize=(10, 6))
+    plt.plot(steps, means, marker="o", color="tab:blue", label="Mean Reward")
+    plt.fill_between(steps, lower, upper, color="tab:blue", alpha=0.2, label="±1 Std Dev")
+    plt.xlabel("Training Step")
+    plt.ylabel("Reward")
+    plt.title("Reward Statistics Over Training")
+    plt.grid(True, linestyle="--", linewidth=0.5, alpha=0.6)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(REWARD_PLOT_PATH)
+    plt.close()
+
+
+def _save_loss_plot(steps: List[int], losses: List[float]) -> None:
+    if not steps:
+        return
+    try:
+        import matplotlib.pyplot as plt  # type: ignore[import-not-found]
+    except ImportError:
+        if not getattr(_save_loss_plot, "_warned", False):
+            print("matplotlib is required to plot loss metrics; skipping plot.")
+            _save_loss_plot._warned = True  # type: ignore[attr-defined]
+        return
+
+    plt.figure(figsize=(10, 6))
+    plt.plot(steps, losses, marker="o", color="tab:red")
+    plt.xlabel("Training Step")
+    plt.ylabel("Loss")
+    plt.title("Average Loss Over Training")
+    plt.grid(True, linestyle="--", linewidth=0.5, alpha=0.6)
+    plt.tight_layout()
+    plt.savefig(LOSS_PLOT_PATH)
+    plt.close()
+
+
+def _save_thought_plot(steps: List[int], means: List[float]) -> None:
+    if not steps:
+        return
+    try:
+        import matplotlib.pyplot as plt  # type: ignore[import-not-found]
+    except ImportError:
+        if not getattr(_save_thought_plot, "_warned", False):
+            print("matplotlib is required to plot thought length metrics; skipping plot.")
+            _save_thought_plot._warned = True  # type: ignore[attr-defined]
+        return
+
+    plt.figure(figsize=(10, 6))
+    plt.plot(steps, means, marker="o", color="tab:orange")
+    plt.xlabel("Training Step")
+    plt.ylabel("Mean Thought Length")
+    plt.title("Mean Chain-of-Thought Length Over Training")
+    plt.grid(True, linestyle="--", linewidth=0.5, alpha=0.6)
+    plt.tight_layout()
+    plt.savefig(THOUGHT_PLOT_PATH)
+    plt.close()
 
 def load_model_and_tokenizer():
     tok = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
@@ -392,13 +469,22 @@ def train_loop(model, tokenizer):
     optimizer = AdamW(model.parameters(), lr=LR)
 
     global EMA_TEACHER
+    reward_steps: List[int] = []
+    mean_rewards: List[float] = []
+    std_rewards: List[float] = []
+    mean_losses: List[float] = []
+    mean_thought_lengths: List[float] = []
 
-    for step in range(1, MAX_STEPS + 1):
+    for step in tqdm(range(1, MAX_STEPS + 1), desc="Steps"):
         loader = iter_fineweb_first_n(
             N_SAMPLES, tokenizer, BATCH_SIZE_PROMPTS, MAX_CONTEXT_LEN
         )
 
-        for batch_idx, batch in enumerate(loader):
+        step_rewards: List[float] = []
+        step_losses: List[float] = []
+        step_thought_lengths: List[int] = []
+
+        for batch_idx, batch in enumerate(tqdm(loader, desc="Batches", leave=False)):
             if EMA_LAZY_INIT and EMA_TEACHER is None:
                 ema_maybe_init(model)
 
@@ -427,8 +513,11 @@ def train_loop(model, tokenizer):
                     ema_lp_all = None
                 else:  # "surprising"
                     pos_list = _positions_from_mask_surprising(EMA_TEACHER, ids_b, msk_b, K_POSITIONS)
-                    ema_lp_all = (_ema_next_token_logprobs_all(EMA_TEACHER, ids_b, msk_b)
-                                  if pos_list else None)
+                    ema_lp_all = (
+                        _ema_next_token_logprobs_all(EMA_TEACHER, ids_b, msk_b)
+                        if pos_list
+                        else None
+                    )
 
                 if not pos_list:
                     continue
@@ -459,7 +548,9 @@ def train_loop(model, tokenizer):
 
                     for _ in range(G):
                         thought_ids, old_logprobs = _sample_thought_and_logprobs(
-                            model, tokenizer, prefix_ids, 
+                            model,
+                            tokenizer,
+                            prefix_ids,
                         )
                         S_pred = _logprob_next_token(model, prefix_ids + thought_ids, next_tok)
                         r = S_pred - S_ema
@@ -467,18 +558,24 @@ def train_loop(model, tokenizer):
                         thought_list.append(thought_ids)
                         old_lp_list.append(old_logprobs)
 
+                    if not r_list:
+                        continue
+
+                    step_rewards.extend(r_list)
+
                     r_tensor = torch.tensor(r_list, dtype=torch.float32, device=device)
                     A_vec = (G / (G - 1.0)) * (r_tensor - r_tensor.mean())
 
                     for i in range(G):
                         thought_ids = thought_list[i]
+                        step_thought_lengths.append(len(thought_ids))
                         logp_cur = _thought_token_logprobs(
                             model, prefix_ids, thought_ids, require_grad=True
                         )
                         logp_old = torch.tensor(
                             old_lp_list[i],
-                            dtype = logp_cur.dtype,
-                            device = logp_cur.device,
+                            dtype=logp_cur.dtype,
+                            device=logp_cur.device,
                         )
                         L_clip_i = _clipped_surrogate_term(
                             logp_cur,
@@ -488,7 +585,7 @@ def train_loop(model, tokenizer):
                             eps_high=CLIP_EPS_HIGH,
                         )
 
-
+                        step_losses.append(float(L_clip_i.detach().item()))
                         (L_clip_i / max(1, GRAD_ACCUM_STEPS)).backward()
                         num_terms += 1
 
@@ -507,10 +604,39 @@ def train_loop(model, tokenizer):
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
+        if step_rewards:
+            mean_reward = statistics.mean(step_rewards)
+            std_reward = statistics.stdev(step_rewards) if len(step_rewards) > 1 else 0.0
+        else:
+            mean_reward = float("nan")
+            std_reward = float("nan")
+
+        if step_losses:
+            mean_loss = statistics.mean(step_losses)
+        else:
+            mean_loss = float("nan")
+
+        if step_thought_lengths:
+            mean_thought_length = statistics.mean(step_thought_lengths)
+        else:
+            mean_thought_length = float("nan")
+
+        reward_steps.append(step)
+        mean_rewards.append(mean_reward)
+        std_rewards.append(std_reward)
+        mean_losses.append(mean_loss)
+        mean_thought_lengths.append(mean_thought_length)
+
+        _save_reward_plot(reward_steps, mean_rewards, std_rewards)
+        _save_loss_plot(reward_steps, mean_losses)
+        _save_thought_plot(reward_steps, mean_thought_lengths)
+
         if step % LOG_EVERY == 0:
-            print(
+            tqdm.write(
                 f"step={step} N={N_SAMPLES} G={NUM_ROLLOUTS} "
-                f"K={K_POSITIONS} strategy={POSITION_STRATEGY} device={DEVICE}"
+                f"K={K_POSITIONS} strategy={POSITION_STRATEGY} device={DEVICE} "
+                f"mean_reward={mean_reward:.6f} std_reward={std_reward:.6f} "
+                f"mean_loss={mean_loss:.6f} mean_thought_len={mean_thought_length:.2f}"
             )
 if __name__ == "__main__":
     model, tokenizer = load_model_and_tokenizer()

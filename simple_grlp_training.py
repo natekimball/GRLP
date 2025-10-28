@@ -35,13 +35,13 @@ DATA_CACHE_DIR = Path("data/fineweb-10k-tokenized")
 MAX_SEQ_LEN = 2048
 HORIZON = 8                             # reward horizon T (small for debug; paper uses long)
 THOUGHT_MAX_TOKENS = 200
-G = 8                                   # number of rollouts per context
+G = 16                                   # number of rollouts per context
 GAMMA = 0.7                             # discount factor
-BATCH_SIZE = 32                         # token-level RLP is expensive; tune for your memory
+BATCH_SIZE = 8                          # token-level RLP is expensive; tune for your memory
 LR = 1e-6
 TAU = 0.999                             # EMA decay
 EPS_CLIP_LOW, EPS_CLIP_HIGH = 0.1, 0.1  # PPO clipping
-NUM_PO_ITERS = 4                        # number of policy optimization iterations per batch
+NUM_PO_ITERS = 3                        # number of policy optimization iterations per batch
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 N_data = 10_000
 # N_data = 1000
@@ -62,6 +62,7 @@ clipped = 0 # global count of clipped tokens
 
 def save_metric_plot(
         reward_history=reward_history,
+        reward_std_history=reward_std_history,
         cot_length_history=cot_length_history,
         loss_history=loss_history,
         step_history=step_history
@@ -69,7 +70,12 @@ def save_metric_plot(
     if not reward_history:
         return
     fig, axes = plt.subplots(3, 1, figsize=(8, 8), sharex=True)
-    axes[0].plot(step_history, reward_history, color="tab:blue")
+    axes[0].plot(step_history, reward_history, color="tab:blue", label="Avg Reward")
+    axes[0].fill_between(step_history, 
+                         [r - s for r, s in zip(reward_history, reward_std_history)], 
+                         [r + s for r, s in zip(reward_history, reward_std_history)], 
+                         color="tab:blue", alpha=0.2, label="Reward Std")
+    axes[0].legend()
     axes[0].set_ylabel("Avg Reward")
     axes[0].grid(alpha=0.3)
     axes[1].plot(step_history, cot_length_history, color="tab:orange")
@@ -171,18 +177,19 @@ def compute_surrogate_loss(per_rollout_thought_logprobs_new, per_rollout_thought
         rhos = torch.exp(log_rhos)                           # (C,)
         # clip
         # clip_rhos = torch.clamp(rhos, 1.0 - EPS_CLIP_LOW, 1.0 + EPS_CLIP_HIGH)
+        # TODO: log this
         clip_rhos = []
         for j in range(len(rhos)):
             if rhos[j] < 1.0 - EPS_CLIP_LOW:
-                clip_rho_j = 1.0 - EPS_CLIP_LOW
+                clip_rho_j = torch.tensor(1.0 - EPS_CLIP_LOW, device=rhos.device)
                 clipped += 1
             elif rhos[j] > 1.0 + EPS_CLIP_HIGH:
-                clip_rho_j = 1.0 + EPS_CLIP_HIGH
+                clip_rho_j = torch.tensor(1.0 + EPS_CLIP_HIGH, device=rhos.device)
                 clipped += 1
             else:
                 clip_rho_j = rhos[j]
             clip_rhos.append(clip_rho_j)
-        clip_rhos = torch.tensor(clip_rhos, device=rhos.device)
+        clip_rhos = torch.stack(clip_rhos)
         A = advantages[i]  # scalar
         # surrogate per token: min(rho * sg(A), clip(rho) * sg(A))
         # negative sign because we maximize reward -> minimize negative surrogate
@@ -304,7 +311,7 @@ for batch_raw in loop:
     L = full_input_ids.size(1)
     # choose some positions t to apply RLP on in this example: for fast debug pick a few
     # In large runs you'd iterate t across the sequence
-    candidate_positions = torch.randint(1, max(2, L - HORIZON - 1), (min(BATCH_SIZE, L - HORIZON - 1),)).tolist()
+    candidate_positions = torch.randint(1, max(2, L - HORIZON - 1), (min(BATCH_SIZE, max(1, L - HORIZON - 1)),)).tolist()
     if len(candidate_positions) == 0:
         continue
 
@@ -404,7 +411,10 @@ for batch_raw in loop:
 
         epoch_losses.extend(batch_surrogate_losses.detach().cpu().float())
         epoch_rewards_mean.extend(batch_rewards.cpu().mean(dim=1))
-        epoch_rewards_std.extend(torch.std(batch_rewards, dim=1).float())
+        epoch_rewards_std.extend(torch.std(batch_rewards, dim=1, unbiased=False).float())
+
+    # TODO: remove this debug print after verifying
+    print(f"Global step {global_step}: clipped tokens so far = {clipped}")
 
     # EMA update
     with torch.no_grad():
@@ -415,8 +425,11 @@ for batch_raw in loop:
     reward_std_history.extend(epoch_rewards_std)
     cot_length_history.extend([avg_cot_length_value]*NUM_PO_ITERS)
     loss_history.extend(epoch_losses)
-    if global_step % PLOT_SAVE_INTERVAL == 0:
-        save_metric_plot()
+
+    print(len(reward_history), len(reward_std_history), len(cot_length_history), len(loss_history))
+
+    if global_step and global_step % PLOT_SAVE_INTERVAL == 0:
+        save_metric_plot(reward_history, reward_std_history, cot_length_history, loss_history, step_history)
     
     if global_step and global_step % MODEL_SAVE_INTERVAL == 0:
         save_dir = f"{MODEL_NAME.split('/')[-1]}-grlp-step{global_step}"

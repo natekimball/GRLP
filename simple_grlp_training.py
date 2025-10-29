@@ -18,6 +18,7 @@ import argparse
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from contextlib import contextmanager
 
 # -----------------------------
 # Config
@@ -35,13 +36,13 @@ DATA_CACHE_DIR = Path("data/fineweb-10k-tokenized")
 MAX_SEQ_LEN = 2048
 HORIZON = 8                             # reward horizon T (small for debug; paper uses long)
 THOUGHT_MAX_TOKENS = 200
-G = 16                                   # number of rollouts per context
+G = 4                                   # number of rollouts per context
 GAMMA = 0.7                             # discount factor
 BATCH_SIZE = 8                          # token-level RLP is expensive; tune for your memory
 LR = 1e-6
 TAU = 0.999                             # EMA decay
 EPS_CLIP_LOW, EPS_CLIP_HIGH = 0.1, 0.1  # PPO clipping
-NUM_PO_ITERS = 3                        # number of policy optimization iterations per batch
+PPO_EPOCHS = 3                          # number of policy optimization iterations per batch
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 N_data = 10_000
 # N_data = 1000
@@ -59,6 +60,26 @@ MODEL_SAVE_INTERVAL = 200
 METRIC_FIG_PATH = Path("simple_grpl_training_metrics.png")
 
 clipped = 0 # global count of clipped tokens
+
+
+def print_gpu_memory(prefix: str) -> None:
+    """Log CUDA memory stats if a GPU is available."""
+    if not torch.cuda.is_available():
+        print(f"{prefix} GPU memory - CUDA not available")
+        return
+    torch.cuda.synchronize()
+    device_index = torch.cuda.current_device()
+    allocated = torch.cuda.memory_allocated(device_index) / 1e6
+    reserved = torch.cuda.memory_reserved(device_index) / 1e6
+    total = torch.cuda.get_device_properties(device_index).total_memory / 1e6
+    print(
+        f"{prefix} GPU memory - allocated: {allocated:.1f} MB, "
+        f"reserved: {reserved:.1f} MB, total: {total:.1f} MB"
+    )
+
+# -----------------------------
+# Helpers
+# -----------------------------
 
 def save_metric_plot(
         reward_history=reward_history,
@@ -89,13 +110,6 @@ def save_metric_plot(
     fig.savefig(METRIC_FIG_PATH, bbox_inches="tight")
     plt.close(fig)
 
-# -----------------------------
-# Helpers
-# -----------------------------
-
-import torch
-from contextlib import contextmanager
-
 @contextmanager
 def inference_context(model, with_grad: bool = False):
     was_training = model.training
@@ -112,6 +126,7 @@ def inference_context(model, with_grad: bool = False):
                 yield
     finally:
         model.train(was_training)
+
 
 def gather_token_logprobs_from_logits(logits, target_ids):
     """
@@ -188,7 +203,7 @@ def compute_returns(rollouts_ct, prefix, gold_window, model, s_ema_per_token):
 
 def compute_surrogate_loss(per_rollout_thought_logprobs_new, per_rollout_thought_logprobs_old, advantages):
     global clipped
-    surrogate_losses = []
+    surrogate_loss = 0
     # For each rollout, compute per-thought clipped surrogate loss (Eq.8)
     for i in range(G):
         # per-token log probs under new/current (we have per_token_logp_new)
@@ -218,9 +233,9 @@ def compute_surrogate_loss(per_rollout_thought_logprobs_new, per_rollout_thought
         # Also divide by |c| as in Eq.8
         surrogate_per_token = torch.min(rhos * A.detach(), clip_rhos * A.detach())
         loss_i = - surrogate_per_token.mean()  # scalar
-        surrogate_losses.append(loss_i)
+        surrogate_loss += loss_i
 
-    return torch.stack(surrogate_losses).mean()
+    return surrogate_loss / G
 
 
 def rollout(model, prefix, P, t):
@@ -299,6 +314,8 @@ for p in ema_model.parameters():
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
 
+print_gpu_memory("Post-model-load")
+
 if os.path.exists(DATA_CACHE_DIR):
     ds = Dataset.load_from_disk(DATA_CACHE_DIR)
 else:
@@ -374,7 +391,7 @@ for batch_raw in loop:
     epoch_rewards_std = []
     epoch_losses = []
     # For each selected position t, compute G rollouts and returns; then accumulate surrogate losses
-    for epoch in range(NUM_PO_ITERS):
+    for epoch in range(PPO_EPOCHS):
         batch_rewards = []
         batch_surrogate_losses = []
 
@@ -411,10 +428,7 @@ for batch_raw in loop:
             batch_surrogate_losses.append(surrogate_loss)
         
 
-        batch_rewards = torch.stack(batch_rewards)
-        batch_surrogate_losses = torch.stack(batch_surrogate_losses)
-        loss = batch_surrogate_losses.mean()
-
+        loss = torch.stack(batch_surrogate_losses).mean()
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -422,14 +436,18 @@ for batch_raw in loop:
         global_step += 1
         step_history.append(global_step)
 
-        postfix = {"loss": loss.detach().cpu().float(), "step": global_step}
-        postfix["avg_reward"] = batch_rewards.mean().item()
+        batch_rewards = torch.stack(batch_rewards)
+        avg_reward = float(batch_rewards.mean().cpu())
+        loss_value = float(loss.detach().cpu())
+
+        postfix = {"loss": loss_value, "step": global_step}
+        postfix["avg_reward"] = avg_reward
         postfix["avg_cot_len"] = avg_cot_length_value
         loop.set_postfix(postfix)
 
-        epoch_losses.extend(batch_surrogate_losses.detach().cpu().float())
-        epoch_rewards_mean.extend(batch_rewards.cpu().mean(dim=1))
-        epoch_rewards_std.extend(torch.std(batch_rewards, dim=1, unbiased=False).float())
+        epoch_losses.append(loss_value)
+        epoch_rewards_mean.append(avg_reward)
+        epoch_rewards_std.append(torch.std(batch_rewards).float())
 
     # TODO: remove this debug print after verifying
     print(f"Global step {global_step}: clipped tokens so far = {clipped}")
@@ -441,10 +459,8 @@ for batch_raw in loop:
 
     reward_history.extend(epoch_rewards_mean)
     reward_std_history.extend(epoch_rewards_std)
-    cot_length_history.extend([avg_cot_length_value]*NUM_PO_ITERS)
+    cot_length_history.extend([avg_cot_length_value]*PPO_EPOCHS)
     loss_history.extend(epoch_losses)
-
-    print(len(reward_history), len(reward_std_history), len(cot_length_history), len(loss_history))
 
     if global_step and global_step % PLOT_SAVE_INTERVAL == 0:
         save_metric_plot(reward_history, reward_std_history, cot_length_history, loss_history, step_history)
@@ -461,6 +477,8 @@ save_dir = f"{MODEL_NAME.split('/')[-1]}-grlp"
 model.save_pretrained(save_dir)
 tokenizer.save_pretrained(save_dir)
 
-save_metric_plot()
+save_metric_plot(reward_history, reward_std_history, cot_length_history, loss_history, step_history)
+
+print_gpu_memory("Post-training")
 
 print("done")

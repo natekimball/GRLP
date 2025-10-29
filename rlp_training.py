@@ -24,7 +24,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
  
 LR = 1e-6
 BATCH_SIZE_PROMPTS = 8
-MAX_CONTEXT_LEN = 1024
+MAX_CONTEXT_LEN = 2048
  
 NUM_ROLLOUTS = 4
 TEMPERATURE = 0.7

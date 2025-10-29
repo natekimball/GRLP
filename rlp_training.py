@@ -5,6 +5,8 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
+import pickle
+
 import torch
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
@@ -24,10 +26,10 @@ LR = 1e-6
 BATCH_SIZE_PROMPTS = 8
 MAX_CONTEXT_LEN = 1024
  
-NUM_ROLLOUTS = 16
+NUM_ROLLOUTS = 4
 TEMPERATURE = 0.7
 TOP_P = 0.95
-THOUGHT_MAX_NEW_TOKENS = 64
+THOUGHT_MAX_NEW_TOKENS = 256
 MIN_NEW_TOKENS = 1
  
 CLIP_EPS_LOW = 0.2
@@ -51,6 +53,7 @@ reward_std_history: List[float] = []
 cot_length_history: List[float] = []
 loss_history: List[float] = []
 step_history: List[int] = []
+METRICS_PICKLE_PATH = Path("rlp_metrics.pkl")
 
 
 DATASET_PATH = "HuggingFaceFW/fineweb"
@@ -90,6 +93,21 @@ def log_sampled_thought(
         log_file.write(f"Prefix: {prefix_text}\n")
         log_file.write(f"Target: {target_text}\n")
         log_file.write(repr(decoded_thought) + "\n\n")
+
+
+def save_metric_snapshot() -> None:
+    """Persist metric histories so partial runs can be analyzed later."""
+    data = {
+        "step_history": list(step_history),
+        "reward_history": list(reward_history),
+        "reward_std_history": list(reward_std_history),
+        "cot_length_history": list(cot_length_history),
+        "loss_history": list(loss_history),
+        "clipped_tokens": CLIPPED_TOKENS,
+        "global_step": GLOBAL_STEP,
+    }
+    with METRICS_PICKLE_PATH.open("wb") as fh:
+        pickle.dump(data, fh)
 
 def load_model_and_tokenizer():
     tok = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
@@ -402,10 +420,11 @@ def train_loop(model, tokenizer):
                         if len(full_prefix_ids) > max_prefix
                         else full_prefix_ids
                     )
- 
-                    S_ema = S_ema_cache.get(
-                        t, _logprob_next_token(EMA_TEACHER, prefix_ids, next_tok)
-                    )
+                    
+                    if (len(full_prefix_ids) <= max_prefix) and (t in S_ema_cache):
+                        S_ema = S_ema_cache[t]
+                    else:
+                        S_ema = _logprob_next_token(EMA_TEACHER, prefix_ids, next_tok)
  
                     r_list: List[float] = []
                     thought_list: List[List[int]] = []
@@ -531,6 +550,7 @@ def train_loop(model, tokenizer):
                     len(cot_length_history),
                     len(loss_history),
                 )
+                save_metric_snapshot()
  
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()

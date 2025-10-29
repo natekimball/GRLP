@@ -3,7 +3,7 @@ from __future__ import annotations
 import random
 from copy import deepcopy
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 
 import pickle
 
@@ -65,7 +65,7 @@ TEXT_COLUMN = "text"
  
  
 K_POSITIONS = 4
-POSITION_STRATEGY = "surprising"
+POSITION_STRATEGY = "random"
 POSITION_STRIDE = 64
  
 if torch.cuda.is_available():
@@ -141,15 +141,6 @@ def ema_update(student: torch.nn.Module, tau: float = EMA_TAU):
         p_t.data.mul_(tau).add_(p_s.data, alpha=1.0 - tau)
     for b_t, b_s in zip(EMA_TEACHER.buffers(), student.buffers()):
         b_t.copy_(b_s)
- 
- 
-def make_behavior_snapshot(student: torch.nn.Module) -> torch.nn.Module:
-    with torch.no_grad():
-        snap = deepcopy(student)
-        snap.eval()
-        for p in snap.parameters():
-            p.requires_grad_(False)
-        return snap
  
  
 def iter_fineweb_first_n(
@@ -271,36 +262,90 @@ def _logprob_next_token(
  
  
 def _sample_thought_ids_for_prefix(
-    model, tokenizer, prefix_ids: List[int], max_new_tokens: int = THOUGHT_MAX_NEW_TOKENS
-) -> List[int]:
+    model,
+    tokenizer,
+    prefix_ids: List[int],
+    max_new_tokens: int = THOUGHT_MAX_NEW_TOKENS,
+) -> Tuple[List[int], torch.Tensor]:
     device = next(model.parameters()).device
     inp = torch.tensor([prefix_ids], dtype=torch.long, device=device)
-    gen = model.generate(
-        inp,
-        do_sample=True,
-        temperature=TEMPERATURE,
-        top_p=TOP_P,
-        max_new_tokens=max_new_tokens,
-        min_new_tokens=MIN_NEW_TOKENS,
-        pad_token_id=tokenizer.eos_token_id,
-        eos_token_id=tokenizer.eos_token_id,
+    eos_token_id = tokenizer.eos_token_id
+
+    def _run_generate(
+        max_new: int,
+        min_new: int,
+        eos_override: Optional[int],
+    ):
+        was_training = model.training
+        if was_training:
+            model.eval()
+        with torch.no_grad():
+            output = model.generate(
+                inp,
+                do_sample=True,
+                temperature=TEMPERATURE,
+                top_p=TOP_P,
+                max_new_tokens=max_new,
+                min_new_tokens=min_new,
+                pad_token_id=eos_token_id,
+                eos_token_id=eos_override,
+                return_dict_in_generate=True,
+                output_scores=True,
+            )
+        if was_training:
+            model.train()
+        return output
+
+    def _tokens_and_logps_from_output(generate_output):
+        seq = generate_output.sequences[0, inp.shape[1] :]
+        tokens = seq.tolist()
+        logps: List[torch.Tensor] = []
+        if generate_output.scores:
+            for step, tok_id in enumerate(tokens):
+                logits_step = generate_output.scores[step][0]
+                log_prob_step = torch.log_softmax(logits_step, dim=-1)[tok_id]
+                logps.append(log_prob_step)
+        return tokens, logps
+
+    output = _run_generate(
+        max_new=max_new_tokens,
+        min_new=MIN_NEW_TOKENS,
+        eos_override=eos_token_id,
     )
-    thought = gen[0, inp.shape[1] :].tolist()
-    eos = tokenizer.eos_token_id
-    if eos in thought:
-        thought = thought[: thought.index(eos)]
-    if len(thought) == 0:
-        gen2 = model.generate(
-            inp,
-            do_sample=True,
-            top_p=TOP_P,
-            temperature=TEMPERATURE,
-            max_new_tokens=1,
-            pad_token_id=eos,
-            eos_token_id=None,
+    thought_ids, logp_values = _tokens_and_logps_from_output(output)
+
+    if eos_token_id is not None and eos_token_id in thought_ids:
+        eos_index = thought_ids.index(eos_token_id)
+        thought_ids = thought_ids[:eos_index]
+        logp_values = logp_values[:eos_index]
+
+    if not thought_ids:
+        output = _run_generate(max_new=1, min_new=1, eos_override=None)
+        thought_ids, logp_values = _tokens_and_logps_from_output(output)
+        if eos_token_id is not None and eos_token_id in thought_ids:
+            eos_index = thought_ids.index(eos_token_id)
+            thought_ids = thought_ids[:eos_index]
+            logp_values = logp_values[:eos_index]
+        if not thought_ids:
+            fallback_ids = [int(inp[0, -1].item())]
+            was_training = model.training
+            if was_training:
+                model.eval()
+            logp_tensor = _thought_token_logprobs(
+                model, prefix_ids, fallback_ids, require_grad=False
+            ).detach()
+            if was_training:
+                model.train()
+            return fallback_ids, logp_tensor
+
+    if logp_values:
+        logp_tensor = torch.stack(logp_values).detach()
+    else:
+        logp_tensor = torch.zeros(
+            len(thought_ids), dtype=next(model.parameters()).dtype, device=device
         )
-        thought = gen2[0, inp.shape[1] :].tolist() or [inp[0, -1].item()]
-    return thought
+
+    return thought_ids, logp_tensor
  
  
 def _thought_token_logprobs(
@@ -364,7 +409,6 @@ def train_loop(model, tokenizer):
             input_ids = batch["input_ids"].to(device, non_blocking=True)
             attention_mask = batch["attention_mask"].to(device, non_blocking=True)
 
-            theta_old = make_behavior_snapshot(model)
             model.train()
             # Collect rollouts and statistics once so we can reuse them over multiple PPO epochs.
             ppo_terms: List[Dict[str, Any]] = []
@@ -427,18 +471,20 @@ def train_loop(model, tokenizer):
                         S_ema = _logprob_next_token(EMA_TEACHER, prefix_ids, next_tok)
  
                     r_list: List[float] = []
-                    thought_list: List[List[int]] = []
- 
+                    thought_records: List[Dict[str, Any]] = []
+
                     for rollout_idx in range(G):
-                        thought_ids = _sample_thought_ids_for_prefix(
-                            theta_old, tokenizer, prefix_ids, THOUGHT_MAX_NEW_TOKENS
+                        thought_ids, logp_old = _sample_thought_ids_for_prefix(
+                            model, tokenizer, prefix_ids, THOUGHT_MAX_NEW_TOKENS
                         )
                         S_pred = _logprob_next_token(
                             model, prefix_ids + thought_ids, next_tok
                         )
                         r = S_pred - S_ema
                         r_list.append(r)
-                        thought_list.append(thought_ids)
+                        thought_records.append(
+                            {"thought_ids": thought_ids, "logp_old": logp_old}
+                        )
                         batch_cot_lengths.append(float(len(thought_ids)))
                         log_sampled_thought(
                             tokenizer,
@@ -460,11 +506,10 @@ def train_loop(model, tokenizer):
                         if r_tensor.numel() > 1
                         else 0.0
                     )
- 
-                    for i, thought_ids in enumerate(thought_list):
-                        logp_old = _thought_token_logprobs(
-                            theta_old, prefix_ids, thought_ids, require_grad=False
-                        ).detach()
+
+                    for i, record in enumerate(thought_records):
+                        thought_ids = record["thought_ids"]
+                        logp_old = record["logp_old"]
                         advantage = A_vec[i].detach()
                         ppo_terms.append(
                             {
@@ -474,9 +519,7 @@ def train_loop(model, tokenizer):
                                 "advantage": advantage,
                             }
                         )
- 
-            del theta_old
- 
+
             num_terms = len(ppo_terms)
             if num_terms == 0:
                 if torch.cuda.is_available():

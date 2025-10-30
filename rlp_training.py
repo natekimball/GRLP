@@ -47,7 +47,6 @@ EMA_TEACHER: Optional[torch.nn.Module] = None
 
 DEBUG_LOG_PATH = Path("debug.txt")
 GLOBAL_STEP = 0
-CLIPPED_TOKENS = 0
 reward_history: List[float] = []
 reward_std_history: List[float] = []
 cot_length_history: List[float] = []
@@ -103,7 +102,6 @@ def save_metric_snapshot() -> None:
         "reward_std_history": list(reward_std_history),
         "cot_length_history": list(cot_length_history),
         "loss_history": list(loss_history),
-        "clipped_tokens": CLIPPED_TOKENS,
         "global_step": GLOBAL_STEP,
     }
     with METRICS_PICKLE_PATH.open("wb") as fh:
@@ -377,14 +375,9 @@ def _clipped_surrogate_term(
     eps_low: float,
     eps_high: float,
 ) -> torch.Tensor:
-    global CLIPPED_TOKENS
     A = advantage.detach()
     rho = torch.exp(logp_cur - logp_old)
     rho_clip = torch.clamp(rho, 1.0 - eps_low, 1.0 + eps_high)
-    with torch.no_grad():
-        rho_det = rho.detach()
-        clipped_mask = (rho_det < 1.0 - eps_low) | (rho_det > 1.0 + eps_high)
-        CLIPPED_TOKENS += int(clipped_mask.sum().item())
     left = rho * A
     right = rho_clip * A
     token_terms = -torch.minimum(left, right)
@@ -584,15 +577,6 @@ def train_loop(model, tokenizer):
                 reward_std_history.append(avg_reward_std)
                 cot_length_history.append(avg_cot_len)
                 loss_history.append(avg_loss)
-                print(
-                    f"Global step {GLOBAL_STEP}: clipped tokens so far = {CLIPPED_TOKENS}"
-                )
-                print(
-                    len(reward_history),
-                    len(reward_std_history),
-                    len(cot_length_history),
-                    len(loss_history),
-                )
                 save_metric_snapshot()
  
             if torch.cuda.is_available():

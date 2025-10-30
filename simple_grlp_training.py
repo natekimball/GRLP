@@ -7,6 +7,7 @@ Generalized RLP prototype (discounted-return advantage estimation)
 import copy
 import os
 from pathlib import Path
+from typing import Dict, List
 
 import torch
 import torch.nn.functional as F
@@ -29,10 +30,11 @@ parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-0.6B-Base", he
 args = parser.parse_args()
 
 MODEL_NAME = args.model_name
-# DATASET = "allenai/dolma"
 DATASET = "HuggingFaceFW/fineweb"
 SPLIT = "train"
+N_DATA = 10_000
 DATA_CACHE_DIR = Path("data/fineweb-10k-tokenized")
+
 MAX_SEQ_LEN = 2048
 HORIZON = 8                             # reward horizon T (small for debug; paper uses long)
 THOUGHT_MAX_TOKENS = 200
@@ -44,11 +46,9 @@ TAU = 0.999                             # EMA decay
 EPS_CLIP_LOW, EPS_CLIP_HIGH = 0.1, 0.1  # PPO clipping
 PPO_EPOCHS = 3                          # number of policy optimization iterations per batch
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-N_data = 10_000
-# N_data = 1000
-dataset_dir = None
-DEBUG_LOG_PATH = Path("debug.txt")
+DTYPE = torch.bfloat16
 
+DEBUG_LOG_PATH = Path("debug.txt")
 PLOT_SAVE_INTERVAL = 5
 MODEL_SAVE_INTERVAL = 200
 METRIC_FIG_PATH = Path("simple_grpl_training_metrics.png")
@@ -73,16 +73,16 @@ def print_gpu_memory(prefix: str) -> None:
 # Helpers
 # -----------------------------
 
-def save_metric_plot(
-        reward_history,
-        reward_std_history,
-        cot_length_history,
-        loss_history,
-    ):
+def save_metric_plot(metrics: Dict[str, List[float]]) -> None:
+    reward_history = metrics["reward"]
+    reward_std_history = metrics["reward_std"]
+    cot_length_history = metrics["cot_length"]
+    loss_history = metrics["loss"]
+    step_history = range(1, len(reward_history) + 1)
     if not reward_history:
         return
+
     fig, axes = plt.subplots(3, 1, figsize=(8, 8), sharex=True)
-    step_history = range(1, len(reward_history) + 1)
     axes[0].plot(step_history, reward_history, color="tab:blue", label="Avg Reward")
     axes[0].fill_between(step_history, 
                          [r - s for r, s in zip(reward_history, reward_std_history)], 
@@ -168,11 +168,13 @@ def make_prefix_and_gold_from_full_input(input_ids, t):
     Given full document token sequence (2D tensor), build:
       prefix = input_ids[:t]
       gold_window = input_ids[t : t + HORIZON]
-    Returns two 2D tensors with batch dim: (1, prefix_len), (1, H)
+      combined = input_ids[t-MAX_SEQ_LEN : t+HORIZON]  (for EMA input)
+    Returns three 2D tensors with batch dim: (1, prefix_len), (1, H), (1, P+H)
     """
     prefix = input_ids[:, t-MAX_SEQ_LEN:t]
     gold = input_ids[:, t : t + HORIZON]
-    return prefix, gold
+    combined = input_ids[:, t-MAX_SEQ_LEN : t+HORIZON]
+    return prefix, gold, combined
 
 def compute_returns(rollouts_ct, prefix, gold_window, model, s_ema_per_token):
     returns = []  # discounted returns R(c_t) for each rollout
@@ -299,7 +301,7 @@ if os.path.exists(DATA_CACHE_DIR):
     ds = Dataset.load_from_disk(DATA_CACHE_DIR)
 else:
     # Load a small subset for debugging. For full experiments, remove slicing.
-    ds = load_dataset(DATASET, split=SPLIT, streaming=True).take(N_data)
+    ds = load_dataset(DATASET, split=SPLIT, streaming=True).take(N_DATA)
     def tokenize_batch(examples):
         # assume examples["text"] exists; truncate to MAX_SEQ_LEN
         out = tokenizer(examples["text"], truncation=True, max_length=MAX_SEQ_LEN, return_tensors=None)
@@ -314,10 +316,12 @@ loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=lambda x
 DEBUG_LOG_PATH.write_text("", encoding="utf-8")
 
 # Metric tracking for visualization
-reward_history = []
-reward_std_history = []
-cot_length_history = []
-loss_history = []
+metric_history = {
+    "reward": [],
+    "reward_std": [],
+    "cot_length": [],
+    "loss": [],
+}
 
 # -----------------------------
 # Training loop
@@ -347,7 +351,7 @@ for batch_raw in loop:
     
     # For each selected position t, compute G rollouts and log probs under old_theta
     for t in candidate_positions:
-        prefix, gold_window = make_prefix_and_gold_from_full_input(full_input_ids, t)  # shapes (1, P), (1, H)
+        prefix, gold_window, full_sequence = make_prefix_and_gold_from_full_input(full_input_ids, t)  # shapes (1, P), (1, H), (1, P+H)
         P = prefix.size(1)
         H_current = gold_window.size(1)
 
@@ -355,10 +359,8 @@ for batch_raw in loop:
         # target_str = tokenizer.decode(gold_window.squeeze(0).tolist())
 
         # compute s_ema per token under EMA model (no-think baseline)
-        # EMA input: prefix + gold_window
-        ema_input = full_input_ids[:, :P+H_current] # (1, P+H)
         # compute per-token logprobs for the gold_window under EMA
-        s_ema_per_token = compute_teacher_forced_logprobs(ema_model, ema_input, gold_window, keep_grad=False)  # (H,)
+        s_ema_per_token = compute_teacher_forced_logprobs(ema_model, full_sequence, gold_window, keep_grad=False)  # (H,)
         # shape already (H,) representing log p(x_{t+k} | x_{<t+k}) under EMA
 
         rollouts_ct, per_rollout_thought_logprobs_old = rollout(model, prefix, P)
@@ -379,14 +381,14 @@ for batch_raw in loop:
         batch_cts.append(rollouts_ct)
         batch_logp_old.append(per_rollout_thought_logprobs_old)
         batch_s_ema_per_token.append(s_ema_per_token)
-        batch_cot_lengths.extend([ct.size(1) for ct in rollouts_ct])
+        batch_cot_lengths.append(float(sum([ct.size(1) for ct in rollouts_ct]) / G))
 
     batch_rewards = torch.stack(batch_rewards)
     avg_reward = float(batch_rewards.mean())
-    reward_history.append(avg_reward)
-    reward_std_history.append(float(batch_rewards.std()))
-    avg_cot_length_value = float(sum(batch_cot_lengths) / len(batch_cot_lengths)) if batch_cot_lengths else None
-    cot_length_history.append(avg_cot_length_value)
+    metric_history["reward"].append(avg_reward)
+    metric_history["reward_std"].append(float(batch_rewards.std()))
+    avg_cot_length_value = sum(batch_cot_lengths) / len(batch_cot_lengths)
+    metric_history["cot_length"].append(avg_cot_length_value)
 
     global_step += 1
 
@@ -424,15 +426,15 @@ for batch_raw in loop:
         epoch_loss += sum(batch_surrogate_losses)
 
     loss_value = epoch_loss / (PPO_EPOCHS * len(candidate_positions))
-    loss_history.append(loss_value)
+    metric_history["loss"].append(loss_value)
 
-    postfix = {"loss": loss_value, "step": global_step}
-    postfix["avg_reward"] = avg_reward
-    postfix["avg_cot_len"] = avg_cot_length_value
+    postfix = {
+        "step": global_step,
+        "loss": loss_value,
+        "avg_reward": avg_reward,
+        "avg_cot_length": avg_cot_length_value,
+    }
     loop.set_postfix(postfix)
-
-    # TODO: remove this debug print after verifying
-    print(f"Global step {global_step}: clipped tokens so far = {clipped}")
 
     # EMA update
     with torch.no_grad():
@@ -440,7 +442,7 @@ for batch_raw in loop:
             p_ema.data.mul_(TAU).add_(p.data, alpha=1.0 - TAU)
 
     if global_step and global_step % PLOT_SAVE_INTERVAL == 0:
-        save_metric_plot(reward_history, reward_std_history, cot_length_history, loss_history)
+        save_metric_plot(metric_history)
     
     if global_step and global_step % MODEL_SAVE_INTERVAL == 0:
         save_dir = f"{MODEL_NAME.split('/')[-1]}-grlp-step{global_step}"
@@ -454,7 +456,7 @@ save_dir = f"{MODEL_NAME.split('/')[-1]}-grlp"
 model.save_pretrained(save_dir)
 tokenizer.save_pretrained(save_dir)
 
-save_metric_plot(reward_history, reward_std_history, cot_length_history, loss_history)
+save_metric_plot(metric_history)
 
 print_gpu_memory("Post-training")
 

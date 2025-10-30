@@ -456,6 +456,7 @@ def _clipped_surrogate_term(
     eps_low: float,
     eps_high: float,
 ) -> torch.Tensor:
+    global CLIPPED_TOKENS
     A = advantage.detach()
     assert logp_cur.shape == logp_old.shape, "Per-token logp length mismatch"
 

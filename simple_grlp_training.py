@@ -7,6 +7,7 @@ Generalized RLP prototype (discounted-return advantage estimation)
 import copy
 import os
 from pathlib import Path
+from typing import Dict, List
 
 import torch
 import torch.nn.functional as F
@@ -29,10 +30,11 @@ parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-0.6B-Base", he
 args = parser.parse_args()
 
 MODEL_NAME = args.model_name
-# DATASET = "allenai/dolma"
 DATASET = "HuggingFaceFW/fineweb"
 SPLIT = "train"
+N_DATA = 10_000
 DATA_CACHE_DIR = Path("data/fineweb-10k-tokenized")
+
 MAX_SEQ_LEN = 2048
 HORIZON = 8                             # reward horizon T (small for debug; paper uses long)
 THOUGHT_MAX_TOKENS = 200
@@ -44,22 +46,12 @@ TAU = 0.999                             # EMA decay
 EPS_CLIP_LOW, EPS_CLIP_HIGH = 0.1, 0.1  # PPO clipping
 PPO_EPOCHS = 3                          # number of policy optimization iterations per batch
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-N_data = 10_000
-# N_data = 1000
-dataset_dir = None
-DEBUG_LOG_PATH = Path("debug.txt")
+DTYPE = torch.bfloat16
 
-# Metric tracking for visualization
-reward_history = []
-reward_std_history = []
-cot_length_history = []
-loss_history = []
-step_history = []
+DEBUG_LOG_PATH = Path("debug.txt")
 PLOT_SAVE_INTERVAL = 5
 MODEL_SAVE_INTERVAL = 200
 METRIC_FIG_PATH = Path("simple_grpl_training_metrics.png")
-
-clipped = 0 # global count of clipped tokens
 
 
 def print_gpu_memory(prefix: str) -> None:
@@ -81,15 +73,15 @@ def print_gpu_memory(prefix: str) -> None:
 # Helpers
 # -----------------------------
 
-def save_metric_plot(
-        reward_history=reward_history,
-        reward_std_history=reward_std_history,
-        cot_length_history=cot_length_history,
-        loss_history=loss_history,
-        step_history=step_history
-    ):
+def save_metric_plot(metrics: Dict[str, List[float]]) -> None:
+    reward_history = metrics["reward"]
+    reward_std_history = metrics["reward_std"]
+    cot_length_history = metrics["cot_length"]
+    loss_history = metrics["loss"]
+    step_history = range(1, len(reward_history) + 1)
     if not reward_history:
         return
+
     fig, axes = plt.subplots(3, 1, figsize=(8, 8), sharex=True)
     axes[0].plot(step_history, reward_history, color="tab:blue", label="Avg Reward")
     axes[0].fill_between(step_history, 
@@ -176,11 +168,13 @@ def make_prefix_and_gold_from_full_input(input_ids, t):
     Given full document token sequence (2D tensor), build:
       prefix = input_ids[:t]
       gold_window = input_ids[t : t + HORIZON]
-    Returns two 2D tensors with batch dim: (1, prefix_len), (1, H)
+      combined = input_ids[t-MAX_SEQ_LEN : t+HORIZON]  (for EMA input)
+    Returns three 2D tensors with batch dim: (1, prefix_len), (1, H), (1, P+H)
     """
-    prefix = input_ids[:, :t]
+    prefix = input_ids[:, t-MAX_SEQ_LEN:t]
     gold = input_ids[:, t : t + HORIZON]
-    return prefix, gold
+    combined = input_ids[:, t-MAX_SEQ_LEN:t+HORIZON]
+    return prefix, gold, combined
 
 def compute_returns(rollouts_ct, prefix, gold_window, model, s_ema_per_token):
     returns = []  # discounted returns R(c_t) for each rollout
@@ -199,10 +193,9 @@ def compute_returns(rollouts_ct, prefix, gold_window, model, s_ema_per_token):
         R = torch.sum(r_per_token * discounts)
         returns.append(R)  # R should be a constant (no grad)
 
-    return returns
+    return torch.stack(returns)
 
 def compute_surrogate_loss(per_rollout_thought_logprobs_new, per_rollout_thought_logprobs_old, advantages):
-    global clipped
     surrogate_loss = 0
     # For each rollout, compute per-thought clipped surrogate loss (Eq.8)
     for i in range(G):
@@ -214,19 +207,7 @@ def compute_surrogate_loss(per_rollout_thought_logprobs_new, per_rollout_thought
         log_rhos = logp_new - logp_old.to(logp_new.device)  # (C,)
         rhos = torch.exp(log_rhos)                           # (C,)
         # clip
-        # clip_rhos = torch.clamp(rhos, 1.0 - EPS_CLIP_LOW, 1.0 + EPS_CLIP_HIGH)
-        clip_rhos = []
-        for j in range(len(rhos)):
-            if rhos[j] < 1.0 - EPS_CLIP_LOW:
-                clip_rho_j = torch.tensor(1.0 - EPS_CLIP_LOW, device=rhos.device)
-                clipped += 1
-            elif rhos[j] > 1.0 + EPS_CLIP_HIGH:
-                clip_rho_j = torch.tensor(1.0 + EPS_CLIP_HIGH, device=rhos.device)
-                clipped += 1
-            else:
-                clip_rho_j = rhos[j]
-            clip_rhos.append(clip_rho_j)
-        clip_rhos = torch.stack(clip_rhos)
+        clip_rhos = torch.clamp(rhos, 1.0 - EPS_CLIP_LOW, 1.0 + EPS_CLIP_HIGH)
         A = advantages[i]  # scalar
         # surrogate per token: min(rho * sg(A), clip(rho) * sg(A))
         # negative sign because we maximize reward -> minimize negative surrogate
@@ -238,7 +219,7 @@ def compute_surrogate_loss(per_rollout_thought_logprobs_new, per_rollout_thought
     return surrogate_loss / G
 
 
-def rollout(model, prefix, P, t):
+def rollout(model, prefix, P):
     # For rollouts we need:
     # - sample G thoughts c_t^{(i)} ~ pi_{theta_old}( . | x_{<t})
     # - compute likelihood under theta_old for importance sampling
@@ -320,7 +301,7 @@ if os.path.exists(DATA_CACHE_DIR):
     ds = Dataset.load_from_disk(DATA_CACHE_DIR)
 else:
     # Load a small subset for debugging. For full experiments, remove slicing.
-    ds = load_dataset(DATASET, split=SPLIT, streaming=True).take(N_data)
+    ds = load_dataset(DATASET, split=SPLIT, streaming=True).take(N_DATA)
     def tokenize_batch(examples):
         # assume examples["text"] exists; truncate to MAX_SEQ_LEN
         out = tokenizer(examples["text"], truncation=True, max_length=MAX_SEQ_LEN, return_tensors=None)
@@ -333,6 +314,14 @@ loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=lambda x
 
 # reset log for new training run
 DEBUG_LOG_PATH.write_text("", encoding="utf-8")
+
+# Metric tracking for visualization
+metric_history = {
+    "reward": [],
+    "reward_std": [],
+    "cot_length": [],
+    "loss": [],
+}
 
 # -----------------------------
 # Training loop
@@ -351,8 +340,7 @@ for batch_raw in loop:
     if len(candidate_positions) == 0:
         continue
 
-    # For each selected position t, compute G rollouts and log probs under old_theta
-    batch_surrogate_losses = []
+    batch_advantages = []
     batch_rewards = []
     batch_cot_lengths = []
     batch_prefixes = []
@@ -361,42 +349,65 @@ for batch_raw in loop:
     batch_logp_old = []
     batch_s_ema_per_token = []
     
+    # For each selected position t, compute G rollouts and log probs under old_theta
     for t in candidate_positions:
-        prefix, gold_window = make_prefix_and_gold_from_full_input(full_input_ids, t)  # shapes (1, P), (1, H)
+        prefix, gold_window, full_sequence = make_prefix_and_gold_from_full_input(full_input_ids, t)  # shapes (1, P), (1, H), (1, P+H)
         P = prefix.size(1)
         H_current = gold_window.size(1)
+
+        # if H_current == 0:
+        #     # Skip positions that do not have any future tokens within the horizon
+        #     continue
 
         # prefix_str = tokenizer.decode(prefix[:, -2*H_current:].squeeze(0).tolist())
         # target_str = tokenizer.decode(gold_window.squeeze(0).tolist())
 
         # compute s_ema per token under EMA model (no-think baseline)
-        # EMA input: prefix + gold_window
-        ema_input = full_input_ids[:, :P+H_current] # (1, P+H)
         # compute per-token logprobs for the gold_window under EMA
-        s_ema_per_token = compute_teacher_forced_logprobs(ema_model, ema_input, gold_window, keep_grad=False)  # (H,)
+        s_ema_per_token = compute_teacher_forced_logprobs(ema_model, full_sequence, gold_window, keep_grad=False)  # (H,)
         # shape already (H,) representing log p(x_{t+k} | x_{<t+k}) under EMA
 
-        rollouts_ct, per_rollout_thought_logprobs_old = rollout(model, prefix, P, t)
+        rollouts_ct, per_rollout_thought_logprobs_old = rollout(model, prefix, P)
+
+        # Now for each rollout evaluate the reasoned per-token log-probs under the current model (p_theta)
+        returns = compute_returns(rollouts_ct, prefix, gold_window, model, s_ema_per_token)
+
+        # Compute group-relative advantages (Eq.7)
+        r_mean = returns.mean()
+        # advantage scaling factor G/(G-1)
+        advantages = (G / (G - 1)) * (returns - r_mean)  # shape (G,)
+
+        batch_advantages.append(advantages)
+        batch_rewards.append(returns.detach().cpu())
 
         batch_prefixes.append(prefix)
         batch_targets.append(gold_window)
         batch_cts.append(rollouts_ct)
         batch_logp_old.append(per_rollout_thought_logprobs_old)
         batch_s_ema_per_token.append(s_ema_per_token)
-        batch_cot_lengths.extend([ct.size(1) for ct in rollouts_ct])
+        batch_cot_lengths.append(float(sum([ct.size(1) for ct in rollouts_ct]) / G))
 
-    avg_cot_length_value = float(sum(batch_cot_lengths) / len(batch_cot_lengths)) if batch_cot_lengths else None
+    # if not batch_advantages:
+    #     continue
 
-    epoch_rewards_mean = []
-    epoch_rewards_std = []
-    epoch_losses = []
+    batch_rewards = torch.stack(batch_rewards)
+    avg_reward = float(batch_rewards.mean())
+    metric_history["reward"].append(avg_reward)
+    metric_history["reward_std"].append(float(batch_rewards.std()))
+    avg_cot_length_value = sum(batch_cot_lengths) / len(batch_cot_lengths)
+    metric_history["cot_length"].append(avg_cot_length_value)
+
+    global_step += 1
+
+    epoch_loss = 0.0
     # For each selected position t, compute G rollouts and returns; then accumulate surrogate losses
     for epoch in range(PPO_EPOCHS):
         batch_rewards = []
         batch_surrogate_losses = []
+        optimizer.zero_grad()
 
-        for prefix, gold_window, rollouts_ct, per_rollout_thought_logprobs_old, s_ema_per_token in zip(
-            batch_prefixes, batch_targets, batch_cts, batch_logp_old, batch_s_ema_per_token
+        for prefix, gold_window, rollouts_ct, per_rollout_thought_logprobs_old, s_ema_per_token, rollout_advantages in zip(
+            batch_prefixes, batch_targets, batch_cts, batch_logp_old, batch_s_ema_per_token, batch_advantages
         ):
 
             # - compute reasoned per-token logprobs s_pred^i for horizon H under current model conditioned on prefix + c_t + gold_window
@@ -409,61 +420,35 @@ for batch_raw in loop:
                 per_token_logp_new = compute_teacher_forced_logprobs(model, inp_thought, ct_tokens)  # (C,)
                 per_rollout_thought_logprobs_new.append(per_token_logp_new)  # (C,)
 
-            # Now for each rollout evaluate the reasoned per-token log-probs under the current model (p_theta)
-            returns = compute_returns(rollouts_ct, prefix, gold_window, model, s_ema_per_token)
-
-            # Convert returns to tensor and compute group-relative advantages (Eq.7)
-            returns_tensor = torch.stack(returns)  # (G,)
-            r_mean = returns_tensor.mean()
-            # advantage scaling factor G/(G-1)
-            advantages = (G / (G - 1)) * (returns_tensor - r_mean)  # shape (G,)
-
             surrogate_loss = compute_surrogate_loss(
                 per_rollout_thought_logprobs_new,
                 per_rollout_thought_logprobs_old,
-                advantages
+                rollout_advantages
             )
+            surrogate_loss.backward()
+            batch_surrogate_losses.append(float(surrogate_loss.detach().cpu()))
 
-            batch_rewards.append(returns_tensor.cpu())
-            batch_surrogate_losses.append(surrogate_loss)
-        
-
-        loss = torch.stack(batch_surrogate_losses).mean()
-        optimizer.zero_grad()
-        loss.backward()
         optimizer.step()
 
-        global_step += 1
-        step_history.append(global_step)
+        epoch_loss += sum(batch_surrogate_losses)
 
-        batch_rewards = torch.stack(batch_rewards)
-        avg_reward = float(batch_rewards.mean().cpu())
-        loss_value = float(loss.detach().cpu())
+    loss_value = epoch_loss / (PPO_EPOCHS * len(candidate_positions))
+    metric_history["loss"].append(loss_value)
 
-        postfix = {"loss": loss_value, "step": global_step}
-        postfix["avg_reward"] = avg_reward
-        postfix["avg_cot_len"] = avg_cot_length_value
-        loop.set_postfix(postfix)
-
-        epoch_losses.append(loss_value)
-        epoch_rewards_mean.append(avg_reward)
-        epoch_rewards_std.append(torch.std(batch_rewards).float())
-
-    # TODO: remove this debug print after verifying
-    print(f"Global step {global_step}: clipped tokens so far = {clipped}")
+    postfix = {
+        "loss": loss_value,
+        "avg_reward": avg_reward,
+        "avg_cot_len": avg_cot_length_value,
+    }
+    loop.set_postfix(postfix)
 
     # EMA update
     with torch.no_grad():
         for p_ema, p in zip(ema_model.parameters(), model.parameters()):
             p_ema.data.mul_(TAU).add_(p.data, alpha=1.0 - TAU)
 
-    reward_history.extend(epoch_rewards_mean)
-    reward_std_history.extend(epoch_rewards_std)
-    cot_length_history.extend([avg_cot_length_value]*PPO_EPOCHS)
-    loss_history.extend(epoch_losses)
-
     if global_step and global_step % PLOT_SAVE_INTERVAL == 0:
-        save_metric_plot(reward_history, reward_std_history, cot_length_history, loss_history, step_history)
+        save_metric_plot(metric_history)
     
     if global_step and global_step % MODEL_SAVE_INTERVAL == 0:
         save_dir = f"{MODEL_NAME.split('/')[-1]}-grlp-step{global_step}"
@@ -477,7 +462,7 @@ save_dir = f"{MODEL_NAME.split('/')[-1]}-grlp"
 model.save_pretrained(save_dir)
 tokenizer.save_pretrained(save_dir)
 
-save_metric_plot(reward_history, reward_std_history, cot_length_history, loss_history, step_history)
+save_metric_plot(metric_history)
 
 print_gpu_memory("Post-training")
 

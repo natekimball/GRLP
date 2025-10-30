@@ -58,7 +58,6 @@ EMA_TEACHER: Optional[torch.nn.Module] = None
 
 DEBUG_LOG_PATH = Path("debug.txt")
 GLOBAL_STEP = 0
-CLIPPED_TOKENS = 0
 reward_history: List[float] = []
 reward_std_history: List[float] = []
 cot_length_history: List[float] = []
@@ -112,7 +111,6 @@ def save_metric_snapshot() -> None:
         "reward_std_history": list(reward_std_history),
         "cot_length_history": list(cot_length_history),
         "loss_history": list(loss_history),
-        "clipped_tokens": CLIPPED_TOKENS,
         "global_step": GLOBAL_STEP,
     }
     with METRICS_PICKLE_PATH.open("wb") as fh:
@@ -458,7 +456,6 @@ def _clipped_surrogate_term(
     eps_low: float,
     eps_high: float,
 ) -> torch.Tensor:
-    global CLIPPED_TOKENS
     A = advantage.detach()
     assert logp_cur.shape == logp_old.shape, "Per-token logp length mismatch"
 
@@ -670,15 +667,6 @@ def train_loop(model, tokenizer):
                 reward_std_history.append(avg_reward_std)
                 cot_length_history.append(avg_cot_len)
                 loss_history.append(avg_loss)
-                print(
-                    f"Global step {GLOBAL_STEP}: clipped tokens so far = {CLIPPED_TOKENS}"
-                )
-                print(
-                    len(reward_history),
-                    len(reward_std_history),
-                    len(cot_length_history),
-                    len(loss_history),
-                )
                 save_metric_snapshot()
  
             if torch.cuda.is_available():

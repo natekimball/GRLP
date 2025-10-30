@@ -173,7 +173,7 @@ def make_prefix_and_gold_from_full_input(input_ids, t):
     """
     prefix = input_ids[:, t-MAX_SEQ_LEN:t]
     gold = input_ids[:, t : t + HORIZON]
-    combined = input_ids[:, t-MAX_SEQ_LEN : t+HORIZON]
+    combined = input_ids[:, t-MAX_SEQ_LEN:t+HORIZON]
     return prefix, gold, combined
 
 def compute_returns(rollouts_ct, prefix, gold_window, model, s_ema_per_token):
@@ -355,6 +355,10 @@ for batch_raw in loop:
         P = prefix.size(1)
         H_current = gold_window.size(1)
 
+        # if H_current == 0:
+        #     # Skip positions that do not have any future tokens within the horizon
+        #     continue
+
         # prefix_str = tokenizer.decode(prefix[:, -2*H_current:].squeeze(0).tolist())
         # target_str = tokenizer.decode(gold_window.squeeze(0).tolist())
 
@@ -382,6 +386,9 @@ for batch_raw in loop:
         batch_logp_old.append(per_rollout_thought_logprobs_old)
         batch_s_ema_per_token.append(s_ema_per_token)
         batch_cot_lengths.append(float(sum([ct.size(1) for ct in rollouts_ct]) / G))
+
+    # if not batch_advantages:
+    #     continue
 
     batch_rewards = torch.stack(batch_rewards)
     avg_reward = float(batch_rewards.mean())
@@ -429,10 +436,9 @@ for batch_raw in loop:
     metric_history["loss"].append(loss_value)
 
     postfix = {
-        "step": global_step,
         "loss": loss_value,
         "avg_reward": avg_reward,
-        "avg_cot_length": avg_cot_length_value,
+        "avg_cot_len": avg_cot_length_value,
     }
     loop.set_postfix(postfix)
 

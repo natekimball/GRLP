@@ -170,7 +170,7 @@ def make_prefix_and_gold_from_full_input(input_ids, t):
       gold_window = input_ids[t : t + HORIZON]
     Returns two 2D tensors with batch dim: (1, prefix_len), (1, H)
     """
-    prefix = input_ids[:, :t]
+    prefix = input_ids[:, t-MAX_SEQ_LEN:t]
     gold = input_ids[:, t : t + HORIZON]
     return prefix, gold
 
@@ -217,7 +217,7 @@ def compute_surrogate_loss(per_rollout_thought_logprobs_new, per_rollout_thought
     return surrogate_loss / G
 
 
-def rollout(model, prefix, P, t):
+def rollout(model, prefix, P):
     # For rollouts we need:
     # - sample G thoughts c_t^{(i)} ~ pi_{theta_old}( . | x_{<t})
     # - compute likelihood under theta_old for importance sampling
@@ -361,7 +361,7 @@ for batch_raw in loop:
         s_ema_per_token = compute_teacher_forced_logprobs(ema_model, ema_input, gold_window, keep_grad=False)  # (H,)
         # shape already (H,) representing log p(x_{t+k} | x_{<t+k}) under EMA
 
-        rollouts_ct, per_rollout_thought_logprobs_old = rollout(model, prefix, P, t)
+        rollouts_ct, per_rollout_thought_logprobs_old = rollout(model, prefix, P)
 
         # Now for each rollout evaluate the reasoned per-token log-probs under the current model (p_theta)
         returns = compute_returns(rollouts_ct, prefix, gold_window, model, s_ema_per_token)

@@ -12,9 +12,20 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
+import torch.nn.functional as F  # NEW
+
+THINK_BOS_TOKEN = "<think>"
+THINK_EOS_TOKEN = "</think>"
+THINK_BOS_ID: Optional[int] = None
+THINK_EOS_ID: Optional[int] = None
+
+
+PPO_POLICY_EVAL = "strict" 
+
+EPS_MIN_PROB = 1e-12
  
  
-MODEL_NAME = "Qwen/Qwen3-0.6B"
+MODEL_NAME = "Qwen/Qwen3-0.6B-Base"
  
  
 DTYPE = "bfloat16"
@@ -82,7 +93,6 @@ def log_sampled_thought(
     prefix_ids: List[int],
     target_id: int,
 ) -> None:
-    """Append decoded thought samples to a debug log for inspection."""
     decoded_thought = tokenizer.decode(thought_ids, skip_special_tokens=False)
     prefix_text = tokenizer.decode(prefix_ids, skip_special_tokens=False)
     target_text = tokenizer.decode([target_id], skip_special_tokens=False)
@@ -96,7 +106,6 @@ def log_sampled_thought(
 
 
 def save_metric_snapshot() -> None:
-    """Persist metric histories so partial runs can be analyzed later."""
     data = {
         "step_history": list(step_history),
         "reward_history": list(reward_history),
@@ -113,10 +122,21 @@ def load_model_and_tokenizer():
     tok = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
- 
+
+    global THINK_BOS_ID, THINK_EOS_ID
+    vocab = tok.get_vocab()
+
+    if THINK_BOS_TOKEN not in vocab or THINK_EOS_TOKEN not in vocab:
+        raise ValueError("Thinking tokens not present in tokenizer vocab")
+
+    THINK_BOS_ID = vocab[THINK_BOS_TOKEN]
+    THINK_EOS_ID = vocab[THINK_EOS_TOKEN]
+    ids_bos = tok.encode(THINK_BOS_TOKEN, add_special_tokens=False)
+    ids_eos = tok.encode(THINK_EOS_TOKEN, add_special_tokens=False)
+    assert len(ids_bos) == 1 and ids_bos[0] == THINK_BOS_ID, "THINK_BOS_TOKEN not atomic"
+    assert len(ids_eos) == 1 and ids_eos[0] == THINK_EOS_ID, "THINK_EOS_TOKEN not atomic"
+
     dtype = torch.bfloat16 if DTYPE == "bfloat16" else torch.float16
- 
-    # Load to CPU, then move whole model to DEVICE.
     model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=dtype)
     model.to(DEVICE)
     model.train()
@@ -131,6 +151,41 @@ def ema_maybe_init(student: torch.nn.Module):
         for p in EMA_TEACHER.parameters():
             p.requires_grad_(False)
  
+
+def _policy_distribution_from_logits(
+    logits: torch.Tensor,
+    temperature: float,
+    top_p: float,
+    eval_mode: str = "strict",
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    logits = logits.float()
+    temp = max(1e-6, float(temperature))
+    probs = F.softmax(logits / temp, dim=-1)
+
+    if eval_mode == "temp_only" or top_p >= 1.0:
+        mask = torch.ones_like(probs, dtype=torch.bool)
+        return probs, mask
+
+    # top-p nucleus mask
+    sorted_probs, sorted_idx = torch.sort(probs, descending=True)
+    cumsum = torch.cumsum(sorted_probs, dim=-1)
+    # k = smallest index s.t. cumulative >= top_p
+    cutoff = torch.searchsorted(
+        cumsum, torch.tensor(top_p, device=probs.device, dtype=probs.dtype), right=False
+    )
+    cutoff = int(min(cutoff.item(), probs.numel() - 1))
+
+    keep_sorted = torch.zeros_like(sorted_probs, dtype=torch.bool)
+    keep_sorted[: cutoff + 1] = True
+    mask = torch.zeros_like(probs, dtype=torch.bool)
+    mask.scatter_(0, sorted_idx, keep_sorted)
+
+    masked = probs * mask.to(probs.dtype)
+    denom = masked.sum()
+    # Renormalize within nucleus
+    probs_norm = masked / (denom + 1e-12)
+    return probs_norm, mask
+
  
 @torch.no_grad()
 def ema_update(student: torch.nn.Module, tau: float = EMA_TAU):
@@ -213,7 +268,6 @@ def _positions_from_mask_stride(mask: torch.Tensor, stride: int) -> List[int]:
  
  
 @torch.no_grad()
-@torch.no_grad()
 def _ema_next_token_logprobs_all(
     ema_model, ids: torch.Tensor, mask: torch.Tensor
 ) -> List[float]:
@@ -246,7 +300,6 @@ def _positions_from_mask_surprising(
     return [int(u) + 1 for u in idx]
  
 @torch.no_grad()
-@torch.no_grad()
 def _logprob_next_token(
     model, input_ids: List[int], next_token_id: int
 ) -> float:
@@ -261,113 +314,141 @@ def _logprob_next_token(
     return float(logp[0, next_token_id].item())
  
  
+@torch.no_grad()
 def _sample_thought_ids_for_prefix(
     model,
     tokenizer,
     prefix_ids: List[int],
     max_new_tokens: int = THOUGHT_MAX_NEW_TOKENS,
 ) -> Tuple[List[int], torch.Tensor]:
+    assert THINK_BOS_ID is not None and THINK_EOS_ID is not None, "Think tokens not initialized"
     device = next(model.parameters()).device
-    inp = torch.tensor([prefix_ids], dtype=torch.long, device=device)
-    eos_token_id = tokenizer.eos_token_id
+    was_training = model.training
+    if was_training:
+        model.eval()
 
-    def _run_generate(
-        max_new: int,
-        min_new: int,
-        eos_override: Optional[int],
-    ):
-        was_training = model.training
-        if was_training:
-            model.eval()
-        with torch.no_grad():
-            output = model.generate(
-                inp,
-                do_sample=True,
-                temperature=TEMPERATURE,
-                top_p=TOP_P,
-                max_new_tokens=max_new,
-                min_new_tokens=min_new,
-                pad_token_id=eos_token_id,
-                eos_token_id=eos_override,
-                return_dict_in_generate=True,
-                output_scores=True,
-            )
-        if was_training:
-            model.train()
-        return output
+    ctx = torch.tensor([prefix_ids + [THINK_BOS_ID]], dtype=torch.long, device=device)
 
-    def _tokens_and_logps_from_output(generate_output):
-        seq = generate_output.sequences[0, inp.shape[1] :]
-        tokens = seq.tolist()
-        logps: List[torch.Tensor] = []
-        if generate_output.scores:
-            for step, tok_id in enumerate(tokens):
-                logits_step = generate_output.scores[step][0]
-                log_prob_step = torch.log_softmax(logits_step, dim=-1)[tok_id]
-                logps.append(log_prob_step)
-        return tokens, logps
+    thought_ids: List[int] = []
+    logp_list: List[torch.Tensor] = []
 
-    output = _run_generate(
-        max_new=max_new_tokens,
-        min_new=MIN_NEW_TOKENS,
-        eos_override=eos_token_id,
-    )
-    thought_ids, logp_values = _tokens_and_logps_from_output(output)
-
-    if eos_token_id is not None and eos_token_id in thought_ids:
-        eos_index = thought_ids.index(eos_token_id)
-        thought_ids = thought_ids[:eos_index]
-        logp_values = logp_values[:eos_index]
-
-    if not thought_ids:
-        output = _run_generate(max_new=1, min_new=1, eos_override=None)
-        thought_ids, logp_values = _tokens_and_logps_from_output(output)
-        if eos_token_id is not None and eos_token_id in thought_ids:
-            eos_index = thought_ids.index(eos_token_id)
-            thought_ids = thought_ids[:eos_index]
-            logp_values = logp_values[:eos_index]
-        if not thought_ids:
-            fallback_ids = [int(inp[0, -1].item())]
-            was_training = model.training
-            if was_training:
-                model.eval()
-            logp_tensor = _thought_token_logprobs(
-                model, prefix_ids, fallback_ids, require_grad=False
-            ).detach()
-            if was_training:
-                model.train()
-            return fallback_ids, logp_tensor
-
-    if logp_values:
-        logp_tensor = torch.stack(logp_values).detach()
-    else:
-        logp_tensor = torch.zeros(
-            len(thought_ids), dtype=next(model.parameters()).dtype, device=device
+    for step in range(max_new_tokens):
+        out = model(input_ids=ctx)
+        logits_step = out.logits[0, -1, :]  # [V]
+        probs_norm, _ = _policy_distribution_from_logits(
+            logits_step, TEMPERATURE, TOP_P, eval_mode="strict"
         )
+        eos_id = tokenizer.eos_token_id
+        if eos_id is not None and eos_id != THINK_EOS_ID and eos_id < probs_norm.numel():
+            probs_norm = probs_norm.clone()
+            probs_norm[eos_id] = 0.0
+        pad_id = tokenizer.pad_token_id
+        if pad_id is not None and pad_id != THINK_EOS_ID and pad_id < probs_norm.numel():
+            probs_norm = probs_norm.clone()
+            probs_norm[pad_id] = 0.0
+        probs_norm = probs_norm / (probs_norm.sum() + 1e-12)
 
-    return thought_ids, logp_tensor
+        if step < max(MIN_NEW_TOKENS - 1, 0):
+            if THINK_EOS_ID < probs_norm.numel():
+                probs_norm = probs_norm.clone()
+                probs_norm[THINK_EOS_ID] = 0.0
+                probs_norm = probs_norm / (probs_norm.sum() + 1e-12)
+
+        if THINK_BOS_ID < probs_norm.numel():
+            probs_norm = probs_norm.clone()
+            probs_norm[THINK_BOS_ID] = 0.0
+            probs_norm = probs_norm / (probs_norm.sum() + 1e-12)
+
+        next_id = int(torch.multinomial(probs_norm, 1).item())
+        logp_list.append(torch.log(probs_norm[next_id].clamp_min(EPS_MIN_PROB)))
+        thought_ids.append(next_id)
+
+        ctx = torch.cat([ctx, torch.tensor([[next_id]], device=device)], dim=1)
+
+        # stop on </think> after MIN_NEW_TOKENS
+        if next_id == THINK_EOS_ID and step + 1 >= MIN_NEW_TOKENS:
+            break
+
+    if len(thought_ids) == 0:
+        thought_ids = [THINK_EOS_ID]
+        logp_list = [torch.log(torch.tensor(EPS_MIN_PROB, device=device))]
+
+    if was_training:
+        model.train()
+
+    logp_old = torch.stack(logp_list).to(torch.float32).detach()
+    return thought_ids, logp_old
+
  
  
 def _thought_token_logprobs(
     model, prefix_ids: List[int], thought_ids: List[int], require_grad: bool
 ) -> torch.Tensor:
+    assert THINK_BOS_ID is not None and THINK_EOS_ID is not None
     device = next(model.parameters()).device
-    seq = torch.tensor([prefix_ids + thought_ids], dtype=torch.long, device=device)
-    prefix_len = len(prefix_ids)
- 
-    if require_grad:
-        out = model(input_ids=seq)
-        logits = out.logits[:, prefix_len - 1 : -1, :]
-        logp = torch.log_softmax(logits, dim=-1)[0]
-        idx = torch.tensor(thought_ids, dtype=torch.long, device=device)
-        return logp.gather(1, idx.view(-1, 1)).squeeze(1)
-    else:
-        with torch.no_grad():
-            out = model(input_ids=seq)
-            logits = out.logits[:, prefix_len - 1 : -1, :]
-            logp = torch.log_softmax(logits, dim=-1)[0]
-            idx = torch.tensor(thought_ids, dtype=torch.long, device=device)
-            return logp.gather(1, idx.view(-1, 1)).squeeze(1).detach()
+
+    def forward_once(x_ids: List[int]) -> torch.Tensor:
+        x = torch.tensor([x_ids], dtype=torch.long, device=device)
+        out = model(input_ids=x)
+        return out.logits[0, -1, :]
+
+    eos_id = getattr(model.config, "eos_token_id", None)
+    if isinstance(eos_id, (list, tuple)):
+        eos_id = eos_id[0] if len(eos_id) > 0 else None
+    pad_id = getattr(model.config, "pad_token_id", None)
+    if isinstance(pad_id, (list, tuple)):
+        pad_id = pad_id[0] if len(pad_id) > 0 else None
+
+    eval_mode = "temp_only" if PPO_POLICY_EVAL == "temp_only" else "strict"
+    top_p_eval = 1.0 if PPO_POLICY_EVAL == "temp_only" else TOP_P
+
+    ctx_ids = list(prefix_ids) + [THINK_BOS_ID]
+    logps: List[torch.Tensor] = []
+
+    prev_grad_state = torch.is_grad_enabled()
+    torch.set_grad_enabled(require_grad)
+    try:
+        for tok in thought_ids:
+            logits_step = forward_once(ctx_ids)
+            probs_norm, _ = _policy_distribution_from_logits(
+                logits_step, TEMPERATURE, top_p_eval, eval_mode=eval_mode
+            )
+
+
+            changed = False
+            if eos_id is not None and eos_id != THINK_EOS_ID and eos_id < probs_norm.numel():
+                probs_norm = probs_norm.clone(); probs_norm[eos_id] = 0.0; changed = True
+            if pad_id is not None and pad_id != THINK_EOS_ID and pad_id < probs_norm.numel():
+                probs_norm = probs_norm.clone(); probs_norm[pad_id] = 0.0; changed = True
+
+            step_idx = len(ctx_ids) - (len(prefix_ids) + 1)  # tokens already generated in thought
+            if step_idx < max(MIN_NEW_TOKENS - 1, 0) and THINK_EOS_ID < probs_norm.numel():
+                probs_norm = probs_norm.clone(); probs_norm[THINK_EOS_ID] = 0.0; changed = True
+
+            if THINK_BOS_ID < probs_norm.numel():
+                probs_norm = probs_norm.clone(); probs_norm[THINK_BOS_ID] = 0.0; changed = True
+
+            if changed:
+                s = probs_norm.sum()
+                if not torch.isfinite(s) or s.item() <= 0:
+                    probs_norm = F.softmax(logits_step.float() / max(1e-6, TEMPERATURE), dim=-1)
+                    if eos_id is not None and eos_id != THINK_EOS_ID and eos_id < probs_norm.numel():
+                        probs_norm[eos_id] = 0.0
+                    if pad_id is not None and pad_id != THINK_EOS_ID and pad_id < probs_norm.numel():
+                        probs_norm[pad_id] = 0.0
+                    if step_idx < max(MIN_NEW_TOKENS - 1, 0) and THINK_EOS_ID < probs_norm.numel():
+                        probs_norm[THINK_EOS_ID] = 0.0
+                    if THINK_BOS_ID < probs_norm.numel():
+                        probs_norm[THINK_BOS_ID] = 0.0
+                probs_norm = probs_norm / (probs_norm.sum() + 1e-12)
+
+            p_tok = probs_norm[tok] if tok < probs_norm.numel() else torch.tensor(0.0, device=device)
+            logps.append(torch.log(p_tok.clamp_min(EPS_MIN_PROB)))
+            ctx_ids.append(tok)
+    finally:
+        torch.set_grad_enabled(prev_grad_state)
+
+    return torch.stack(logps).to(torch.float32)
  
  
 def _clipped_surrogate_term(
@@ -379,15 +460,16 @@ def _clipped_surrogate_term(
 ) -> torch.Tensor:
     global CLIPPED_TOKENS
     A = advantage.detach()
-    rho = torch.exp(logp_cur - logp_old)
+    assert logp_cur.shape == logp_old.shape, "Per-token logp length mismatch"
+
+    rho = torch.exp(logp_cur - logp_old)  # float32
     rho_clip = torch.clamp(rho, 1.0 - eps_low, 1.0 + eps_high)
+
     with torch.no_grad():
-        rho_det = rho.detach()
-        clipped_mask = (rho_det < 1.0 - eps_low) | (rho_det > 1.0 + eps_high)
+        clipped_mask = (rho < 1.0 - eps_low) | (rho > 1.0 + eps_high)
         CLIPPED_TOKENS += int(clipped_mask.sum().item())
-    left = rho * A
-    right = rho_clip * A
-    token_terms = -torch.minimum(left, right)
+
+    token_terms = -torch.minimum(rho * A, rho_clip * A)
     return token_terms.mean()
  
 def train_loop(model, tokenizer):
@@ -410,7 +492,6 @@ def train_loop(model, tokenizer):
             attention_mask = batch["attention_mask"].to(device, non_blocking=True)
 
             model.train()
-            # Collect rollouts and statistics once so we can reuse them over multiple PPO epochs.
             ppo_terms: List[Dict[str, Any]] = []
 
             B = input_ids.shape[0]
@@ -426,7 +507,6 @@ def train_loop(model, tokenizer):
                 if valid_len < 2:
                     continue
  
-                # Choose positions
                 if POSITION_STRATEGY == "random":
                     pos_list = _positions_from_mask_random(msk_b, K_POSITIONS)
                     ema_lp_all = None
@@ -448,7 +528,7 @@ def train_loop(model, tokenizer):
                 if not pos_list:
                     continue
  
-                max_prefix = max(1, MAX_CONTEXT_LEN - THOUGHT_MAX_NEW_TOKENS - 1)
+                max_prefix = max(1, MAX_CONTEXT_LEN - THOUGHT_MAX_NEW_TOKENS - 2)
  
                 S_ema_cache: Dict[int, float] = {}
                 if ema_lp_all is not None:
@@ -477,8 +557,14 @@ def train_loop(model, tokenizer):
                         thought_ids, logp_old = _sample_thought_ids_for_prefix(
                             model, tokenizer, prefix_ids, THOUGHT_MAX_NEW_TOKENS
                         )
+
+                        thought_for_pred = [THINK_BOS_ID] + thought_ids
+                        if thought_ids[-1] != THINK_EOS_ID:
+                            thought_for_pred = thought_for_pred + [THINK_EOS_ID]
+
+                        
                         S_pred = _logprob_next_token(
-                            model, prefix_ids + thought_ids, next_tok
+                            model, prefix_ids + thought_for_pred, next_tok
                         )
                         r = S_pred - S_ema
                         r_list.append(r)
@@ -491,7 +577,7 @@ def train_loop(model, tokenizer):
                             step_idx=step,
                             position=t,
                             rollout_idx=rollout_idx,
-                            thought_ids=thought_ids,
+                            thought_ids=thought_for_pred,
                             prefix_ids=prefix_ids,
                             target_id=next_tok,
                         )

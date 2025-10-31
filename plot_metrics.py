@@ -7,7 +7,7 @@ from typing import Dict, Any, List, Tuple
 import matplotlib.pyplot as plt
 
 METRICS_PATH = Path("rlp_metrics.pkl")
-OUTPUT_DIR = Path("metric_plots")
+OUTPUT_DIR = Path("rlp_metric_plots")
 
 
 def _align_steps(

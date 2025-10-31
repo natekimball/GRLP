@@ -38,7 +38,7 @@ DATA_CACHE_DIR = Path("data/fineweb-10k-tokenized")
 MAX_SEQ_LEN = 2048
 HORIZON = 8                             # reward horizon T (small for debug; paper uses long)
 THOUGHT_MAX_TOKENS = 1024
-G = 4                                   # number of rollouts per context
+G = 8                                   # number of rollouts per context
 GAMMA = 0.7                             # discount factor
 BATCH_SIZE = 8                          # token-level RLP is expensive; tune for your memory
 LR = 1e-6
@@ -171,9 +171,11 @@ def make_prefix_and_gold_from_full_input(input_ids, t):
       combined = input_ids[t-MAX_SEQ_LEN : t+HORIZON]  (for EMA input)
     Returns three 2D tensors with batch dim: (1, prefix_len), (1, H), (1, P+H)
     """
-    prefix = input_ids[:, t-MAX_SEQ_LEN:t]
-    gold = input_ids[:, t : t + HORIZON]
-    combined = input_ids[:, t-MAX_SEQ_LEN:t+HORIZON]
+    start_idx = max(0, t - MAX_SEQ_LEN)
+    end_idx = min(input_ids.size(1), t + HORIZON)
+    prefix = input_ids[:, start_idx:t]
+    gold = input_ids[:, t:end_idx]
+    combined = input_ids[:, start_idx:end_idx]
     return prefix, gold, combined
 
 def compute_returns(rollouts_ct, prefix, gold_window, model, s_ema_per_token):

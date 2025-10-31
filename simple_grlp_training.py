@@ -37,7 +37,7 @@ DATA_CACHE_DIR = Path("data/fineweb-10k-tokenized")
 
 MAX_SEQ_LEN = 2048
 HORIZON = 8                             # reward horizon T (small for debug; paper uses long)
-THOUGHT_MAX_TOKENS = 200
+THOUGHT_MAX_TOKENS = 1024
 G = 4                                   # number of rollouts per context
 GAMMA = 0.7                             # discount factor
 BATCH_SIZE = 8                          # token-level RLP is expensive; tune for your memory
@@ -50,8 +50,8 @@ DTYPE = torch.bfloat16
 
 DEBUG_LOG_PATH = Path("debug.txt")
 PLOT_SAVE_INTERVAL = 5
-MODEL_SAVE_INTERVAL = 200
-METRIC_FIG_PATH = Path("simple_grpl_training_metrics.png")
+MODEL_SAVE_INTERVAL = 100
+METRIC_FIG_PATH = Path("simple_grlp_training_metrics.png")
 
 
 def print_gpu_memory(prefix: str) -> None:

@@ -13,6 +13,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers.cache_utils import DynamicCache
 from datasets import load_dataset, Dataset
 from tqdm import tqdm
 import argparse
@@ -20,6 +21,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from contextlib import contextmanager
+
 
 # -----------------------------
 # Config
@@ -35,7 +37,7 @@ SPLIT = "train"
 N_DATA = 10_000
 DATA_CACHE_DIR = Path("data/fineweb-10k-tokenized")
 
-MAX_SEQ_LEN = 2048
+MAX_SEQ_LEN = 4096
 HORIZON = 8                             # reward horizon T (small for debug; paper uses long)
 THOUGHT_MAX_TOKENS = 1024
 G = 8                                   # number of rollouts per context
@@ -47,6 +49,8 @@ EPS_CLIP_LOW, EPS_CLIP_HIGH = 0.1, 0.1  # PPO clipping
 PPO_EPOCHS = 3                          # number of policy optimization iterations per batch
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.bfloat16
+COMPILE_MODEL = False
+USE_FLASH_ATTN = False
 
 DEBUG_LOG_PATH = Path("debug.txt")
 PLOT_SAVE_INTERVAL = 5
@@ -84,7 +88,7 @@ def save_metric_plot(metrics: Dict[str, List[float]]) -> None:
 
     fig, axes = plt.subplots(3, 1, figsize=(8, 8), sharex=True)
     axes[0].plot(step_history, reward_history, color="tab:blue", label="Avg Reward")
-    axes[0].fill_between(step_history, 
+    axes[0].fill_between(step_history,
                          [r - s for r, s in zip(reward_history, reward_std_history)], 
                          [r + s for r, s in zip(reward_history, reward_std_history)], 
                          color="tab:blue", alpha=0.2, label="Reward Std")
@@ -168,14 +172,12 @@ def make_prefix_and_gold_from_full_input(input_ids, t):
     Given full document token sequence (2D tensor), build:
       prefix = input_ids[:t]
       gold_window = input_ids[t : t + HORIZON]
-      combined = input_ids[t-MAX_SEQ_LEN : t+HORIZON]  (for EMA input)
-    Returns three 2D tensors with batch dim: (1, prefix_len), (1, H), (1, P+H)
+      combined = input_ids[:t+HORIZON]  (for EMA input)
+    Returns three 2D tensors with batch dim: (1, P), (1, H), (1, P+H)
     """
-    start_idx = max(0, t - MAX_SEQ_LEN)
-    end_idx = min(input_ids.size(1), t + HORIZON)
-    prefix = input_ids[:, start_idx:t]
-    gold = input_ids[:, t:end_idx]
-    combined = input_ids[:, start_idx:end_idx]
+    prefix = input_ids[:, : t]
+    gold = input_ids[:, t : t + HORIZON]
+    combined = input_ids[:, : t + HORIZON]
     return prefix, gold, combined
 
 def compute_returns(rollouts_ct, prefix, gold_window, model, s_ema_per_token):
@@ -221,47 +223,82 @@ def compute_surrogate_loss(per_rollout_thought_logprobs_new, per_rollout_thought
     return surrogate_loss / G
 
 
-def rollout(model, prefix):
-    # For rollouts we need:
-    # - sample G thoughts c_t^{(i)} ~ pi_{theta_old}( . | x_{<t})
-    # - compute likelihood under theta_old for importance sampling
-    with inference_context(model, with_grad=False):
-        rollouts_ct = []
-        per_rollout_thought_logprobs_old = []  # per-rollout per-token logprobs under theta_old for the thought tokens (for importance)
-        # Sample G thoughts using theta_old_model. Use generate for clarity; for production sample step-wise while recording logprobs.
-        # Simple generation: supply prefix, generate short CoT (max_new_tokens ~ 32)
-        # We generate only the CoT tokens, not the gold next tokens.
-        for gidx in range(G):
-            # To call generate with prefix as tensors we need to decode + generate, or use generate with input_ids directly:
-            # use do_sample True and some sampling config
-            generated = model.generate(
-                prefix,
-                attention_mask=torch.ones_like(prefix),
-                max_new_tokens=THOUGHT_MAX_TOKENS,
-                do_sample=True, 
-                temperature=0.7,
-                eos_token_id=[tokenizer.eos_token_id, end_thought_id.item()],
-                pad_token_id=tokenizer.pad_token_id,
-            )
-            if generated[0, -1] == tokenizer.eos_token_id:
-                generated[0, -1] = end_thought_id.item()
-            elif generated[0, -1] != end_thought_id.item():
-                generated = torch.cat([generated, end_thought_id], dim=1)
+@torch.no_grad()
+def rollout(model, prefix, num_rollouts=G, temperature=0.7, max_new_tokens=THOUGHT_MAX_TOKENS):
+    """
+    Optimized rollout generation:
+      - Computes prefix cache once
+      - Samples G rollouts in parallel (temperature 0.7)
+      - Collects both sampled CoT tokens and untempered logprobs
+    Returns:
+      rollouts_ct: List[Tensor]  (G, 1, C_i)
+      per_rollout_thought_logprobs_old: List[Tensor]  (G, C_i)
+    """
+    model.eval()
+    eos_token_id = tokenizer.eos_token_id
+    end_thought = end_thought_id.item()
 
-            # generated contains prefix + cot; remove the prefix part to get only cot tokens
-            cot_tokens = generated[:, prefix.size(1):]  # shape (1, C)
-            # log_sampled_thought(global_step, t, gidx, cot_tokens.squeeze(0), prefix_str, target_str)
+    # 1️⃣ Compute prefix KV-cache once
+    prefix_out = model(
+        input_ids=prefix,
+        attention_mask=torch.ones_like(prefix),
+        use_cache=True
+    )
+    prefix_pkv = prefix_out.past_key_values
+    if isinstance(prefix_pkv, tuple):
+        prefix_pkv = DynamicCache.from_legacy_cache(prefix_pkv)
+    prefix_pkv.batch_repeat_interleave(num_rollouts)
+    past_key_values = prefix_pkv
 
-            # (keep as-is; the logprob computation will handle exact tokens)
-            rollouts_ct.append(cot_tokens)
+    # 3️⃣ Initialize rollout state
+    generated = prefix.repeat(num_rollouts, 1)
+    attention_mask = torch.ones_like(generated)
+    eos_reached = torch.zeros(num_rollouts, dtype=torch.bool, device=generated.device)
 
-            # compute per-token logprob of cot_tokens under theta_old (behavior). We'll need these to form log pi_old per token.
-            # we want the logprob of each token in cot_tokens (teacher forcing style)
-            # logits where position j predicts next token j+1; probabilities for cot token u are at logits indices P+u-1
-            per_token_logp_old = compute_teacher_forced_logprobs(model, generated, cot_tokens, keep_grad=False)  # (C,)
-            per_rollout_thought_logprobs_old.append(per_token_logp_old)
+    rollouts_ct = torch.full((num_rollouts, 0), fill_value=0, dtype=torch.long, device=generated.device)
+    per_token_logp = torch.empty(num_rollouts, 0, dtype=torch.bfloat16, device=generated.device)
 
-    return rollouts_ct, per_rollout_thought_logprobs_old
+    # Prealloc temp tensors to avoid reallocations
+    token_buffer = torch.empty(num_rollouts, 1, dtype=torch.long, device=generated.device)
+
+    # 4️⃣ Step-by-step autoregressive sampling
+    for _ in range(max_new_tokens):
+        out = model(
+            input_ids=generated[:, -1:],  # last token only
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=True
+        )
+
+        logits = out.logits[:, -1, :]  # [G, vocab]
+        past_key_values = out.past_key_values
+
+        # Store untempered log probs for PPO baseline (not divided by temperature)
+        logp_untempered = torch.log_softmax(logits, dim=-1)
+
+        # Temperature sampling
+        probs = torch.softmax(logits / temperature, dim=-1)
+        next_tokens = torch.multinomial(probs, num_samples=1, out=token_buffer)
+
+        # Record logprobs for chosen tokens
+        chosen_logp = logp_untempered.gather(-1, next_tokens)
+        per_token_logp = torch.cat((per_token_logp, chosen_logp), dim=1)
+
+        # Append new tokens to rollout continuation
+        rollouts_ct = torch.cat((rollouts_ct, next_tokens), dim=1)
+        generated = torch.cat((generated, next_tokens), dim=1)
+        attention_mask = torch.cat((attention_mask, torch.ones_like(next_tokens)), dim=1)
+
+        # Handle early stopping (<eos> or </think>)
+        eos_reached |= (next_tokens.squeeze(-1) == eos_token_id) | (next_tokens.squeeze(-1) == end_thought)
+        if eos_reached.all():
+            break
+
+    # 5️⃣ Post-process: split per-rollout
+    rollouts_ct_list = [rollouts_ct[i, :].unsqueeze(0) for i in range(num_rollouts)]
+    per_token_logp_list = [per_token_logp[i, :] for i in range(num_rollouts)]
+
+    return rollouts_ct_list, per_token_logp_list
 
 
 # -----------------------------
@@ -271,7 +308,6 @@ tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
 # Set pad_token to eos_token to avoid warnings
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
-# tokenizer.add_special_tokens({"additional_special_tokens": ["<think>", "</think>"]})
 start_thought_id = tokenizer("<think>", return_tensors="pt").input_ids.to(DEVICE)
 end_thought_id = tokenizer("</think>", return_tensors="pt").input_ids.to(DEVICE)
 
@@ -288,8 +324,15 @@ def log_sampled_thought(step_idx: int, position: int, rollout_idx: int, cot_toke
         log_file.write(f"Target: {target}\n")
         log_file.write(repr(decoded) + "\n\n")
 
+print("Loading model...")
+attn_implementation = "flash_attention_2" if USE_FLASH_ATTN else "eager"
+model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, attn_implementation=attn_implementation, trust_remote_code=True).to(DEVICE)
+model.config.use_flash_attention = USE_FLASH_ATTN
 
-model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, trust_remote_code=True).to(DEVICE)
+if COMPILE_MODEL:
+    print("Compiling model...")
+    model = torch.compile(model)
+
 ema_model = copy.deepcopy(model).to(DEVICE)
 for p in ema_model.parameters():
     p.requires_grad_(False)
@@ -303,10 +346,6 @@ if os.path.exists(DATA_CACHE_DIR):
 else:
     # Load a small subset for debugging. For full experiments, remove slicing.
     ds = load_dataset(DATASET, split=SPLIT, streaming=True).take(N_DATA)
-    def tokenize_batch(examples):
-        # assume examples["text"] exists; truncate to MAX_SEQ_LEN
-        out = tokenizer(examples["text"], truncation=True, max_length=MAX_SEQ_LEN, return_tensors=None)
-        return out
     ds = ds.map(lambda ex: {"input_ids": tokenizer(ex["text"], truncation=True, max_length=MAX_SEQ_LEN)["input_ids"]})
     ds = Dataset.from_list(list(ds))
     ds.save_to_disk(DATA_CACHE_DIR)
@@ -338,7 +377,7 @@ for batch_raw in loop:
     # choose some positions t to apply RLP on in this example: for fast debug pick a few
     # In large runs you'd iterate t across the sequence
 
-    if L - HORIZON - 1 <= 2:
+    if L <= HORIZON + 3:
         continue
     num_candidate_positions = min(BATCH_SIZE, L - HORIZON - 1)
     candidate_positions = torch.randint(2, L - HORIZON - 1, (num_candidate_positions,)).tolist()
@@ -358,9 +397,10 @@ for batch_raw in loop:
         P = prefix.size(1)
         H_current = gold_window.size(1)
 
-        # if H_current == 0:
-        #     # Skip positions that do not have any future tokens within the horizon
-        #     continue
+        if P == 0 or H_current == 0:
+            print(f'skipping position {t} with P={P}, H_current={H_current}, document_len={full_input_ids.size(1)}')
+            print(candidate_positions)
+            continue
 
         # prefix_str = tokenizer.decode(prefix[:, -2*H_current:].squeeze(0).tolist())
         # target_str = tokenizer.decode(gold_window.squeeze(0).tolist())
@@ -403,7 +443,7 @@ for batch_raw in loop:
 
     global_step += 1
 
-    epoch_loss = 0.0
+    avg_loss = 0.0
     # For each selected position t, compute G rollouts and returns; then accumulate surrogate losses
     for epoch in range(PPO_EPOCHS):
         batch_rewards = []
@@ -432,17 +472,16 @@ for batch_raw in loop:
             surrogate_loss.backward()
             batch_surrogate_losses.append(float(surrogate_loss.detach().cpu()))
 
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
-        epoch_loss += sum(batch_surrogate_losses)
+        avg_loss += sum(batch_surrogate_losses) / len(batch_surrogate_losses) / PPO_EPOCHS
 
-    loss_value = epoch_loss / (PPO_EPOCHS * len(candidate_positions))
-    metric_history["loss"].append(loss_value)
-
+    metric_history["loss"].append(avg_loss)
     postfix = {
-        "loss": loss_value,
-        "avg_reward": avg_reward,
-        "avg_cot_len": avg_cot_length_value,
+        "loss": avg_loss,
+        "reward": avg_reward,
+        "cot_len": avg_cot_length_value,
     }
     loop.set_postfix(postfix)
 

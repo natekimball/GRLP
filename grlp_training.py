@@ -37,12 +37,12 @@ SPLIT = "train"
 N_DATA = 10_000
 DATA_CACHE_DIR = Path("data/fineweb-10k-tokenized")
 
-MAX_SEQ_LEN = 4096
+MAX_SEQ_LEN = 1024
 HORIZON = 8                             # reward horizon T (small for debug; paper uses long)
-THOUGHT_MAX_TOKENS = 1024
-G = 8                                   # number of rollouts per context
+THOUGHT_MAX_TOKENS = 512
+G = 4                                   # number of rollouts per context
 GAMMA = 0.7                             # discount factor
-BATCH_SIZE = 8                          # token-level RLP is expensive; tune for your memory
+BATCH_SIZE = 4                          # token-level RLP is expensive; tune for your memory
 LR = 1e-6
 TAU = 0.999                             # EMA decay
 EPS_CLIP_LOW, EPS_CLIP_HIGH = 0.1, 0.1  # PPO clipping
@@ -224,7 +224,7 @@ def compute_surrogate_loss(per_rollout_thought_logprobs_new, per_rollout_thought
 
 
 @torch.no_grad()
-def rollout(model, prefix, num_rollouts=G, temperature=0.7, max_new_tokens=THOUGHT_MAX_TOKENS):
+def rollout(model, prefix, num_rollouts=G, temperature=0.7, max_new_tokens=THOUGHT_MAX_TOKENS, prefix_cache=None):
     """
     Optimized rollout generation:
       - Computes prefix cache once
@@ -238,28 +238,57 @@ def rollout(model, prefix, num_rollouts=G, temperature=0.7, max_new_tokens=THOUG
     eos_token_id = tokenizer.eos_token_id
     end_thought = end_thought_id.item()
 
-    # 1️⃣ Compute prefix KV-cache once
-    prefix_out = model(
-        input_ids=prefix,
-        attention_mask=torch.ones_like(prefix),
-        use_cache=True
-    )
-    prefix_pkv = prefix_out.past_key_values
-    if isinstance(prefix_pkv, tuple):
-        prefix_pkv = DynamicCache.from_legacy_cache(prefix_pkv)
-    prefix_pkv.batch_repeat_interleave(num_rollouts)
-    past_key_values = prefix_pkv
+    if prefix_cache is not None:
+        if isinstance(prefix_cache, tuple):
+            past_key_values = DynamicCache.from_legacy_cache(prefix_cache)
+        else:
+            past_key_values = DynamicCache.from_legacy_cache(prefix_cache.to_legacy_cache())
+        past_key_values.batch_repeat_interleave(num_rollouts)
 
-    # 3️⃣ Initialize rollout state
-    generated = prefix.repeat(num_rollouts, 1)
-    attention_mask = torch.ones_like(generated)
-    eos_reached = torch.zeros(num_rollouts, dtype=torch.bool, device=generated.device)
+        # Split prefix into actual document prefix + deterministic think token
+        base_prefix = prefix[:, :-1]
+        think_token = prefix[:, -1:].repeat(num_rollouts, 1)
 
-    rollouts_ct = torch.full((num_rollouts, 0), fill_value=0, dtype=torch.long, device=generated.device)
-    per_token_logp = torch.empty(num_rollouts, 0, dtype=torch.bfloat16, device=generated.device)
+        generated = base_prefix.repeat(num_rollouts, 1)
+        attention_mask = torch.ones_like(generated)
+        eos_reached = torch.zeros(num_rollouts, dtype=torch.bool, device=generated.device)
 
-    # Prealloc temp tensors to avoid reallocations
-    token_buffer = torch.empty(num_rollouts, 1, dtype=torch.long, device=generated.device)
+        rollouts_ct = torch.full((num_rollouts, 0), fill_value=0, dtype=torch.long, device=generated.device)
+        per_token_logp = torch.empty(num_rollouts, 0, dtype=torch.bfloat16, device=generated.device)
+        token_buffer = torch.empty(num_rollouts, 1, dtype=torch.long, device=generated.device)
+
+        attention_mask = torch.cat((attention_mask, torch.ones_like(think_token)), dim=1)
+        out = model(
+            input_ids=think_token,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=True
+        )
+        past_key_values = out.past_key_values
+        generated = torch.cat((generated, think_token), dim=1)
+    else:
+        # 1️⃣ Compute prefix KV-cache once
+        prefix_out = model(
+            input_ids=prefix,
+            attention_mask=torch.ones_like(prefix),
+            use_cache=True
+        )
+        prefix_pkv = prefix_out.past_key_values
+        if isinstance(prefix_pkv, tuple):
+            prefix_pkv = DynamicCache.from_legacy_cache(prefix_pkv)
+        prefix_pkv.batch_repeat_interleave(num_rollouts)
+        past_key_values = prefix_pkv
+
+        # 3️⃣ Initialize rollout state
+        generated = prefix.repeat(num_rollouts, 1)
+        attention_mask = torch.ones_like(generated)
+        eos_reached = torch.zeros(num_rollouts, dtype=torch.bool, device=generated.device)
+
+        rollouts_ct = torch.full((num_rollouts, 0), fill_value=0, dtype=torch.long, device=generated.device)
+        per_token_logp = torch.empty(num_rollouts, 0, dtype=torch.bfloat16, device=generated.device)
+
+        # Prealloc temp tensors to avoid reallocations
+        token_buffer = torch.empty(num_rollouts, 1, dtype=torch.long, device=generated.device)
 
     # 4️⃣ Step-by-step autoregressive sampling
     for _ in range(max_new_tokens):
@@ -299,6 +328,53 @@ def rollout(model, prefix, num_rollouts=G, temperature=0.7, max_new_tokens=THOUG
     per_token_logp_list = [per_token_logp[i, :] for i in range(num_rollouts)]
 
     return rollouts_ct_list, per_token_logp_list
+
+
+def slice_cache_to_length(full_cache, length: int) -> DynamicCache:
+    """Create a DynamicCache truncated to the first ``length`` tokens."""
+    if length <= 0:
+        return DynamicCache()
+
+    if isinstance(full_cache, DynamicCache):
+        base_layers = full_cache.to_legacy_cache()
+    else:
+        base_layers = full_cache
+
+    truncated_layers = []
+    for keys, values in base_layers:
+        if keys is None or keys.numel() == 0:
+            truncated_layers.append((keys, values))
+            continue
+        limit = min(keys.size(-2), length)
+        truncated_layers.append((keys[:, :, :limit, :].contiguous(), values[:, :, :limit, :].contiguous()))
+
+    return DynamicCache.from_legacy_cache(tuple(truncated_layers))
+
+
+def collect_prefix_caches(model, input_ids, positions):
+    """Build KV caches for specified prefix lengths via a single forward pass."""
+    if not positions:
+        return {}
+
+    unique_positions = sorted({pos for pos in positions if pos > 0})
+    if not unique_positions:
+        return {}
+
+    max_required = unique_positions[-1]
+    with inference_context(model, with_grad=False):
+        attn_mask = torch.ones((input_ids.size(0), max_required), dtype=torch.long, device=input_ids.device)
+        outputs = model(
+            input_ids=input_ids[:, :max_required],
+            attention_mask=attn_mask,
+            use_cache=True,
+        )
+
+    cache_full = outputs.past_key_values
+    caches: Dict[int, DynamicCache] = {}
+    for length in unique_positions:
+        caches[length] = slice_cache_to_length(cache_full, length)
+
+    return caches
 
 
 # -----------------------------
@@ -382,6 +458,8 @@ for batch_raw in loop:
     num_candidate_positions = min(BATCH_SIZE, L - HORIZON - 1)
     candidate_positions = torch.randint(2, L - HORIZON - 1, (num_candidate_positions,)).tolist()
 
+    prefix_cache_map = collect_prefix_caches(model, full_input_ids, candidate_positions)
+
     batch_advantages = []
     batch_rewards = []
     batch_cot_lengths = []
@@ -406,12 +484,16 @@ for batch_raw in loop:
         # target_str = tokenizer.decode(gold_window.squeeze(0).tolist())
 
         # compute s_ema per token under EMA model (no-think baseline)
-        # compute per-token logprobs for the gold_window under EMA
         s_ema_per_token = compute_teacher_forced_logprobs(ema_model, full_sequence, gold_window, keep_grad=False)  # (H,)
         # shape already (H,) representing log p(x_{t+k} | x_{<t+k}) under EMA
 
         reasoning_prefix = torch.cat([prefix, start_thought_id], dim=1)  # (1, P)
-        rollouts_ct, per_rollout_thought_logprobs_old = rollout(model, reasoning_prefix)
+        cache_for_prefix = prefix_cache_map.get(P)
+        rollouts_ct, per_rollout_thought_logprobs_old = rollout(
+            model,
+            reasoning_prefix,
+            prefix_cache=cache_for_prefix,
+        )
 
         # Now for each rollout evaluate the reasoned per-token log-probs under the current model (p_theta)
         returns = compute_returns(rollouts_ct, reasoning_prefix, gold_window, model, s_ema_per_token)
@@ -431,8 +513,9 @@ for batch_raw in loop:
         batch_s_ema_per_token.append(s_ema_per_token)
         batch_cot_lengths.append(float(sum([ct.size(1) for ct in rollouts_ct]) / G))
 
-    # if not batch_advantages:
-    #     continue
+    if not batch_rewards:
+        print("No valid rollouts in batch, skipping...")
+        continue
 
     batch_rewards = torch.stack(batch_rewards)
     avg_reward = float(batch_rewards.mean())

@@ -49,7 +49,7 @@ EPS_CLIP_LOW, EPS_CLIP_HIGH = 0.1, 0.1  # PPO clipping
 PPO_EPOCHS = 3                          # number of policy optimization iterations per batch
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.bfloat16
-COMPILE_MODEL = False
+COMPILE_MODEL = True
 USE_FLASH_ATTN = False
 
 DEBUG_LOG_PATH = Path("debug.txt")
@@ -57,6 +57,7 @@ PLOT_SAVE_INTERVAL = 5
 MODEL_SAVE_INTERVAL = 100
 METRIC_FIG_PATH = Path("simple_grlp_training_metrics.png")
 
+torch.set_float32_matmul_precision('high')
 
 def print_gpu_memory(prefix: str) -> None:
     """Log CUDA memory stats if a GPU is available."""
@@ -107,7 +108,7 @@ def save_metric_plot(metrics: Dict[str, List[float]]) -> None:
     plt.close(fig)
 
 @contextmanager
-def inference_context(model, with_grad: bool = False):
+def inference_context(model, with_grad: bool = False, inference_mode: bool = False):
     was_training = model.training
     if with_grad:
         model.train()
@@ -116,6 +117,9 @@ def inference_context(model, with_grad: bool = False):
     try:
         if with_grad:
             with torch.enable_grad():
+                yield
+        elif inference_mode:
+            with torch.inference_mode():
                 yield
         else:
             with torch.no_grad():
@@ -136,28 +140,33 @@ def gather_token_logprobs_from_logits(logits, target_ids):
     return logprobs.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
 
 
-def compute_teacher_forced_logprobs(model, input_ids, gold_targets, *, keep_grad=True):
+def compute_teacher_forced_logprobs(model, input_ids, gold_targets, *, keep_grad=True, inference_mode=False):
     """
     Compute per-token log-probs under teacher forcing for the sequence:
       model(input_ids) where input_ids = prefix + optional cot + gold_seq
     We want the log-probabilities for gold_seq positions (the final len(gold_targets) tokens).
     Returns: tensor shape (len(gold_targets),) of log-probs (float)
     """
-    with inference_context(model, with_grad=keep_grad):
+    with inference_context(model, with_grad=keep_grad, inference_mode=inference_mode):
         # model returns logits for each position predicting the *next* token
-        outputs = model(input_ids=input_ids).logits  # (1, seq_len, vocab)
+        outputs = model(
+            input_ids=input_ids,
+            attention_mask=torch.ones_like(input_ids),
+            past_key_values=None,
+            use_cache=False
+        ).logits  # (1, seq_len, vocab)
     # the predicted distribution at position j corresponds to next token at j+1.
     # Suppose input_ids = [prefix_tokens, cot_tokens, gold0, gold1, ...,
     #                       gold_{H-1}]
     # We want the model predictions for gold0..gold_{H-1}.
     seq_len = input_ids.size(1)
-    H = gold_targets.size(1)
+    target_len = gold_targets.size(1)
     # number of tokens before gold tokens:
-    prefix_len = seq_len - H
-    # logits indices that predict gold tokens are at positions: prefix_len - 1 ... prefix_len + H - 2
+    prefix_len = seq_len - target_len
+    # logits indices that predict gold tokens are at positions: prefix_len - 1 ... prefix_len + target_len - 2
     # but ensure prefix_len >= 1 (if prefix is empty, typical causal LM has BOS; this script assumes prefix_len >=1)
     start_idx = prefix_len - 1
-    end_idx = prefix_len + H - 1  # exclusive index in python slicing
+    end_idx = prefix_len + target_len - 1  # exclusive index in python slicing
     # select logits corresponding to predictions for gold tokens:
     logits_for_gold = outputs[:, start_idx:end_idx, :]   # (1, H, V)
     # targets for those positions are exactly gold_targets (shape (1, H))
@@ -168,36 +177,62 @@ def compute_teacher_forced_logprobs(model, input_ids, gold_targets, *, keep_grad
 
 
 def make_prefix_and_gold_from_full_input(input_ids, t):
-    """
-    Given full document token sequence (2D tensor), build:
-      prefix = input_ids[:t]
-      gold_window = input_ids[t : t + HORIZON]
-      combined = input_ids[:t+HORIZON]  (for EMA input)
-    Returns three 2D tensors with batch dim: (1, P), (1, H), (1, P+H)
-    """
     prefix = input_ids[:, : t]
     gold = input_ids[:, t : t + HORIZON]
-    combined = input_ids[:, : t + HORIZON]
-    return prefix, gold, combined
+    return prefix, gold
 
-def compute_returns(rollouts_ct, prefix, gold_window, model, s_ema_per_token):
-    returns = []  # discounted returns R(c_t) for each rollout
+@torch.no_grad()
+def compute_returns(rollouts_ct, rollout_caches, prefix, gold_window, model, s_ema_per_token):
+    """Compute discounted returns for each rollout in a single batched pass per context length."""
 
-    for i in range(len(rollouts_ct)):
-        # Build input: prefix + cot_tokens + gold_window
-        inp_reasoned = torch.cat([prefix, rollouts_ct[i], gold_window], dim=1)  # (1, P+C+H)
-        # compute per-token log-probs under current model for gold_window
-        s_pred_per_token = compute_teacher_forced_logprobs(model, inp_reasoned, gold_window, keep_grad=False)  # (H,)
-        # compute r_i per token = s_pred^i - s_ema^i
-        # ensure ema_per_token_logp has same length H_current
-        r_per_token = s_pred_per_token - s_ema_per_token.to(s_pred_per_token.device)
-        # discounted sum on the same device to avoid host syncs
-        steps = torch.arange(r_per_token.size(0), device=r_per_token.device, dtype=r_per_token.dtype)
-        discounts = GAMMA ** steps
-        R = torch.sum(r_per_token * discounts)
-        returns.append(R)  # R should be a constant (no grad)
+    num_rollouts = len(rollouts_ct)
+    if num_rollouts == 0:
+        return torch.empty(0, device=prefix.device, dtype=s_ema_per_token.dtype)
 
-    return torch.stack(returns)
+    appended_tokens = torch.cat([end_thought_id.to(prefix.device), gold_window], dim=1)
+    gold_len = gold_window.size(1)
+    s_ema = s_ema_per_token.to(prefix.device)
+    steps = torch.arange(gold_len, device=prefix.device, dtype=s_ema.dtype)
+    discounts = torch.pow(torch.tensor(GAMMA, device=prefix.device, dtype=s_ema.dtype), steps)
+
+    grouped: Dict[int, List[tuple[int, DynamicCache]]] = {}
+    for idx, (ct_tensor, cache) in enumerate(zip(rollouts_ct, rollout_caches)):
+        ct = ct_tensor.clone()
+        eos_positions = (ct == tokenizer.eos_token_id).nonzero(as_tuple=False)
+        if eos_positions.numel() > 0:
+            cutoff = eos_positions[0, 1].item()
+            ct = ct[:, :cutoff]
+
+        context_len = prefix.size(1) + ct.size(1)
+        cache_trimmed = slice_cache_to_length(cache, context_len)
+        grouped.setdefault(context_len, []).append((idx, cache_trimmed))
+
+    returns = torch.empty(num_rollouts, device=prefix.device, dtype=s_ema.dtype)
+    gold_repeat_template = gold_window.to(prefix.device)
+
+    for context_len, entries in grouped.items():
+        batch_size = len(entries)
+        stacked_cache = stack_caches([entry[1] for entry in entries])
+        input_batch = appended_tokens.repeat(batch_size, 1)
+        attn_mask = torch.ones(batch_size, context_len + appended_tokens.size(1), dtype=torch.long, device=prefix.device)
+        gold_targets = gold_repeat_template.repeat(batch_size, 1)
+
+        outputs = model(
+            input_ids=input_batch,
+            attention_mask=attn_mask,
+            past_key_values=stacked_cache,
+            use_cache=True,
+        )
+
+        logits_gold = outputs.logits[:, 1:, :]
+        s_pred_group = gather_token_logprobs_from_logits(logits_gold, gold_targets)
+        r_per_token = s_pred_group - s_ema.unsqueeze(0)
+        discounted = (r_per_token * discounts.unsqueeze(0)).sum(dim=1)
+
+        for (idx, _), R in zip(entries, discounted):
+            returns[idx] = R
+
+    return returns
 
 def compute_surrogate_loss(per_rollout_thought_logprobs_new, per_rollout_thought_logprobs_old, advantages):
     surrogate_loss = 0
@@ -230,13 +265,13 @@ def rollout(model, prefix, num_rollouts=G, temperature=0.7, max_new_tokens=THOUG
       - Computes prefix cache once
       - Samples G rollouts in parallel (temperature 0.7)
       - Collects both sampled CoT tokens and untempered logprobs
-    Returns:
-      rollouts_ct: List[Tensor]  (G, 1, C_i)
-      per_rollout_thought_logprobs_old: List[Tensor]  (G, C_i)
+        Returns:
+            rollouts_ct: List[Tensor]  (G, 1, C_i)
+            per_rollout_thought_logprobs_old: List[Tensor]  (G, C_i)
+            rollout_caches: List[DynamicCache]
     """
     model.eval()
     eos_token_id = tokenizer.eos_token_id
-    end_thought = end_thought_id.item()
 
     if prefix_cache is not None:
         if isinstance(prefix_cache, tuple):
@@ -271,6 +306,7 @@ def rollout(model, prefix, num_rollouts=G, temperature=0.7, max_new_tokens=THOUG
         prefix_out = model(
             input_ids=prefix,
             attention_mask=torch.ones_like(prefix),
+            past_key_values=None,
             use_cache=True
         )
         prefix_pkv = prefix_out.past_key_values
@@ -318,16 +354,44 @@ def rollout(model, prefix, num_rollouts=G, temperature=0.7, max_new_tokens=THOUG
         generated = torch.cat((generated, next_tokens), dim=1)
         attention_mask = torch.cat((attention_mask, torch.ones_like(next_tokens)), dim=1)
 
-        # Handle early stopping (<eos> or </think>)
-        eos_reached |= (next_tokens.squeeze(-1) == eos_token_id) | (next_tokens.squeeze(-1) == end_thought)
+        # Handle early stopping <eos>
+        eos_reached |= (next_tokens.squeeze(-1) == eos_token_id) 
+        # eos_reached |= (next_tokens.squeeze(-1) == end_thought)
         if eos_reached.all():
             break
 
     # 5️⃣ Post-process: split per-rollout
-    rollouts_ct_list = [rollouts_ct[i, :].unsqueeze(0) for i in range(num_rollouts)]
-    per_token_logp_list = [per_token_logp[i, :] for i in range(num_rollouts)]
+    rollouts_ct_list = []
+    per_token_logp_list = []
+    for i in range(num_rollouts):
+        tokens = rollouts_ct[i, :]
+        logps = per_token_logp[i, :]
 
-    return rollouts_ct_list, per_token_logp_list
+        eos_positions = (tokens == eos_token_id).nonzero(as_tuple=False)
+        if eos_positions.numel() > 0:
+            cutoff = eos_positions[0].item() + 1  # include eos token
+            tokens = tokens[:cutoff].clone()
+            logps = logps[:cutoff].clone()
+        else:
+            tokens = tokens.clone()
+            logps = logps.clone()
+
+        rollouts_ct_list.append(tokens.unsqueeze(0))
+        per_token_logp_list.append(logps)
+
+    if not isinstance(past_key_values, DynamicCache):
+        final_cache = DynamicCache.from_legacy_cache(past_key_values)
+    else:
+        final_cache = past_key_values
+
+    prefix_len = prefix.size(1)
+    rollout_cache_list = []
+    for i, ct_tokens in enumerate(rollouts_ct_list):
+        total_len = prefix_len + ct_tokens.size(1)
+        cache_i = select_cache_for_batch(final_cache, i, total_len)
+        rollout_cache_list.append(cache_i)
+
+    return rollouts_ct_list, per_token_logp_list, rollout_cache_list
 
 
 def slice_cache_to_length(full_cache, length: int) -> DynamicCache:
@@ -351,6 +415,63 @@ def slice_cache_to_length(full_cache, length: int) -> DynamicCache:
     return DynamicCache.from_legacy_cache(tuple(truncated_layers))
 
 
+def select_cache_for_batch(full_cache, batch_idx: int, length: int | None = None) -> DynamicCache:
+    """Extract (and optionally truncate) a single batch entry from a cache."""
+    if isinstance(full_cache, DynamicCache):
+        base_layers = full_cache.to_legacy_cache()
+    else:
+        base_layers = full_cache
+
+    selected_layers = []
+    for keys, values in base_layers:
+        if keys is None or keys.numel() == 0:
+            selected_layers.append((keys, values))
+            continue
+        keys_sel = keys[batch_idx : batch_idx + 1].clone()
+        values_sel = values[batch_idx : batch_idx + 1].clone()
+        if length is not None:
+            limit = min(keys_sel.size(-2), length)
+            keys_sel = keys_sel[:, :, :limit, :].contiguous()
+            values_sel = values_sel[:, :, :limit, :].contiguous()
+        selected_layers.append((keys_sel, values_sel))
+
+    return DynamicCache.from_legacy_cache(tuple(selected_layers))
+
+
+def stack_caches(cache_list: List[DynamicCache]) -> DynamicCache:
+    """Stack a list of single-example caches along the batch dimension."""
+    if not cache_list:
+        return DynamicCache()
+
+    legacy_layers = []
+    for cache in cache_list:
+        if isinstance(cache, DynamicCache):
+            legacy_layers.append(cache.to_legacy_cache())
+        else:
+            legacy_layers.append(cache)
+
+    num_layers = len(legacy_layers[0])
+    stacked_layers = []
+    for layer_idx in range(num_layers):
+        layer_keys: List[torch.Tensor] = []
+        layer_values: List[torch.Tensor] = []
+        for layer in legacy_layers:
+            keys, values = layer[layer_idx]
+            if keys is None or keys.numel() == 0:
+                layer_keys = []
+                break
+            layer_keys.append(keys)
+            layer_values.append(values)
+
+        if not layer_keys:
+            stacked_layers.append((None, None))
+            continue
+
+        stacked_layers.append((torch.cat(layer_keys, dim=0), torch.cat(layer_values, dim=0)))
+
+    return DynamicCache.from_legacy_cache(tuple(stacked_layers))
+
+
 def collect_prefix_caches(model, input_ids, positions):
     """Build KV caches for specified prefix lengths via a single forward pass."""
     if not positions:
@@ -366,6 +487,7 @@ def collect_prefix_caches(model, input_ids, positions):
         outputs = model(
             input_ids=input_ids[:, :max_required],
             attention_mask=attn_mask,
+            past_key_values=None,
             use_cache=True,
         )
 
@@ -458,6 +580,7 @@ for batch_raw in loop:
     num_candidate_positions = min(BATCH_SIZE, L - HORIZON - 1)
     candidate_positions = torch.randint(2, L - HORIZON - 1, (num_candidate_positions,)).tolist()
 
+    ema_token_logprobs_full = compute_teacher_forced_logprobs(ema_model, full_input_ids, full_input_ids[:, 1:], keep_grad=False, inference_mode=True)  # (L-1,)
     prefix_cache_map = collect_prefix_caches(model, full_input_ids, candidate_positions)
 
     batch_advantages = []
@@ -471,32 +594,28 @@ for batch_raw in loop:
     
     # For each selected position t, compute G rollouts and log probs under old_theta
     for t in candidate_positions:
-        prefix, gold_window, full_sequence = make_prefix_and_gold_from_full_input(full_input_ids, t)  # shapes (1, P-1), (1, H), (1, P-1+H)
+        prefix, gold_window = make_prefix_and_gold_from_full_input(full_input_ids, t)  # shapes (1, P-1), (1, H)
         P = prefix.size(1)
+        # TODO: in the future could handle end positions with shorter horizons
         H_current = gold_window.size(1)
-
-        if P == 0 or H_current == 0:
-            print(f'skipping position {t} with P={P}, H_current={H_current}, document_len={full_input_ids.size(1)}')
-            print(candidate_positions)
-            continue
 
         # prefix_str = tokenizer.decode(prefix[:, -2*H_current:].squeeze(0).tolist())
         # target_str = tokenizer.decode(gold_window.squeeze(0).tolist())
 
-        # compute s_ema per token under EMA model (no-think baseline)
-        s_ema_per_token = compute_teacher_forced_logprobs(ema_model, full_sequence, gold_window, keep_grad=False)  # (H,)
-        # shape already (H,) representing log p(x_{t+k} | x_{<t+k}) under EMA
+        ema_start = t - 1  # logits index predicting token at position t
+        ema_end = ema_start + H_current
+        s_ema_per_token = ema_token_logprobs_full[ema_start:ema_end]
 
         reasoning_prefix = torch.cat([prefix, start_thought_id], dim=1)  # (1, P)
         cache_for_prefix = prefix_cache_map.get(P)
-        rollouts_ct, per_rollout_thought_logprobs_old = rollout(
+        rollouts_ct, per_rollout_thought_logprobs_old, rollout_caches = rollout(
             model,
             reasoning_prefix,
             prefix_cache=cache_for_prefix,
         )
 
         # Now for each rollout evaluate the reasoned per-token log-probs under the current model (p_theta)
-        returns = compute_returns(rollouts_ct, reasoning_prefix, gold_window, model, s_ema_per_token)
+        returns = compute_returns(rollouts_ct, rollout_caches, reasoning_prefix, gold_window, model, s_ema_per_token)
 
         # Compute group-relative advantages (Eq.7)
         r_mean = returns.mean()

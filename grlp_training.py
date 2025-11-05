@@ -37,12 +37,12 @@ SPLIT = "train"
 N_DATA = 10_000
 DATA_CACHE_DIR = Path("data/fineweb-10k-tokenized")
 
-MAX_SEQ_LEN = 1024
+MAX_SEQ_LEN = 2048
 HORIZON = 8                             # reward horizon T (small for debug; paper uses long)
-THOUGHT_MAX_TOKENS = 512
-G = 4                                   # number of rollouts per context
+THOUGHT_MAX_TOKENS = 2048
+G = 16                                  # number of rollouts per context
 GAMMA = 0.7                             # discount factor
-BATCH_SIZE = 4                          # token-level RLP is expensive; tune for your memory
+BATCH_SIZE = 16                         # token-level RLP is expensive; tune for your memory
 LR = 1e-6
 TAU = 0.999                             # EMA decay
 EPS_CLIP_LOW, EPS_CLIP_HIGH = 0.1, 0.1  # PPO clipping
@@ -73,6 +73,7 @@ def print_gpu_memory(prefix: str) -> None:
         f"{prefix} GPU memory - allocated: {allocated:.1f} MB, "
         f"reserved: {reserved:.1f} MB, total: {total:.1f} MB"
     )
+
 
 # -----------------------------
 # Helpers
@@ -577,20 +578,45 @@ for batch_raw in loop:
         # Now for each rollout evaluate the reasoned per-token log-probs under the current model (p_theta)
         returns = compute_returns(rollouts_ct, rollout_caches, reasoning_prefix, gold_window, model, s_ema_per_token)
 
+        # Drop rollout caches to avoid holding GPU references beyond this point
+        del rollout_caches
+
+        # Move rollout artifacts to CPU to free VRAM until PPO phase
+        rollouts_ct_cpu = [ct.detach().cpu() for ct in rollouts_ct]
+        logp_old_cpu = [logp.detach().cpu() for logp in per_rollout_thought_logprobs_old]
+        s_ema_cpu = s_ema_per_token.detach().cpu()
+        reasoning_prefix_cpu = reasoning_prefix.detach().cpu()
+        gold_window_cpu = gold_window.detach().cpu()
+
         # Compute group-relative advantages (Eq.7)
         r_mean = returns.mean()
         # advantage scaling factor G/(G-1)
         advantages = (G / (G - 1)) * (returns - r_mean)  # shape (G,)
 
-        batch_advantages.append(advantages)
+        batch_advantages.append(advantages.detach().cpu())
         batch_rewards.append(returns.detach().cpu())
+        batch_prefixes.append(reasoning_prefix_cpu)
+        batch_targets.append(gold_window_cpu)
+        batch_cts.append(rollouts_ct_cpu)
+        batch_logp_old.append(logp_old_cpu)
+        batch_s_ema_per_token.append(s_ema_cpu)
+        batch_cot_lengths.append(float(sum(ct.size(1) for ct in rollouts_ct_cpu) / G))
 
-        batch_prefixes.append(reasoning_prefix)
-        batch_targets.append(gold_window)
-        batch_cts.append(rollouts_ct)
-        batch_logp_old.append(per_rollout_thought_logprobs_old)
-        batch_s_ema_per_token.append(s_ema_per_token)
-        batch_cot_lengths.append(float(sum([ct.size(1) for ct in rollouts_ct]) / G))
+        # Remove GPU tensors from scope
+        del prefix
+        del rollouts_ct
+        del per_rollout_thought_logprobs_old
+        del reasoning_prefix
+        del gold_window
+        del s_ema_per_token
+        del returns
+        del advantages
+        torch.cuda.empty_cache()
+
+    prefix_cache_map.clear()
+    del prefix_cache_map
+    del ema_token_logprobs_full
+    torch.cuda.empty_cache()
 
     if not batch_rewards:
         print("No valid rollouts in batch, skipping...")
@@ -616,6 +642,12 @@ for batch_raw in loop:
             batch_prefixes, batch_targets, batch_cts, batch_logp_old, batch_s_ema_per_token, batch_advantages
         ):
 
+            prefix = prefix.to(DEVICE)
+            gold_window = gold_window.to(DEVICE)
+            rollouts_ct = [ct.to(DEVICE) for ct in rollouts_ct]
+            per_rollout_thought_logprobs_old = [logp.to(DEVICE) for logp in per_rollout_thought_logprobs_old]
+            rollout_advantages = rollout_advantages.to(DEVICE)
+
             # - compute reasoned per-token logprobs s_pred^i for horizon H under current model conditioned on prefix + c_t + gold_window
             per_rollout_thought_logprobs_new = []  # per-rollout per-token logprobs under current model for thought tokens
             for i in range(len(rollouts_ct)):
@@ -633,6 +665,14 @@ for batch_raw in loop:
             )
             surrogate_loss.backward()
             batch_surrogate_losses.append(float(surrogate_loss.detach().cpu()))
+
+            del prefix
+            del gold_window
+            del rollouts_ct
+            del per_rollout_thought_logprobs_old
+            del rollout_advantages
+            del per_rollout_thought_logprobs_new
+            torch.cuda.empty_cache()
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()

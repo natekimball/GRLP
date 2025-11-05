@@ -183,56 +183,48 @@ def make_prefix_and_gold_from_full_input(input_ids, t):
 
 @torch.no_grad()
 def compute_returns(rollouts_ct, rollout_caches, prefix, gold_window, model, s_ema_per_token):
-    """Compute discounted returns for each rollout in a single batched pass per context length."""
+    """Compute discounted returns for each rollout individually."""
 
-    num_rollouts = len(rollouts_ct)
-    if num_rollouts == 0:
-        return torch.empty(0, device=prefix.device, dtype=s_ema_per_token.dtype)
-
-    appended_tokens = torch.cat([end_thought_id.to(prefix.device), gold_window], dim=1)
+    device = prefix.device
+    s_ema = s_ema_per_token.to(device)
     gold_len = gold_window.size(1)
-    s_ema = s_ema_per_token.to(prefix.device)
-    steps = torch.arange(gold_len, device=prefix.device, dtype=s_ema.dtype)
-    discounts = torch.pow(torch.tensor(GAMMA, device=prefix.device, dtype=s_ema.dtype), steps)
+    steps = torch.arange(gold_len, device=device, dtype=s_ema.dtype)
+    discounts = torch.pow(torch.tensor(GAMMA, device=device, dtype=s_ema.dtype), steps)
 
-    grouped: Dict[int, List[tuple[int, DynamicCache]]] = {}
-    for idx, (ct_tensor, cache) in enumerate(zip(rollouts_ct, rollout_caches)):
-        ct = ct_tensor.clone()
+    appended_tokens = torch.cat([end_thought_id.to(device), gold_window], dim=1)
+    gold_window = gold_window.to(device)
+
+    returns = []
+    prefix_len = prefix.size(1)
+
+    for ct, cache in zip(rollouts_ct, rollout_caches):
+        ct_len = ct.size(1)
         eos_positions = (ct == tokenizer.eos_token_id).nonzero(as_tuple=False)
         if eos_positions.numel() > 0:
-            cutoff = eos_positions[0, 1].item()
-            ct = ct[:, :cutoff]
+            ct_len = eos_positions[0, 1].item()
 
-        context_len = prefix.size(1) + ct.size(1)
+        context_len = prefix_len + ct_len
         cache_trimmed = slice_cache_to_length(cache, context_len)
-        grouped.setdefault(context_len, []).append((idx, cache_trimmed))
 
-    returns = torch.empty(num_rollouts, device=prefix.device, dtype=s_ema.dtype)
-    gold_repeat_template = gold_window.to(prefix.device)
-
-    for context_len, entries in grouped.items():
-        batch_size = len(entries)
-        stacked_cache = stack_caches([entry[1] for entry in entries])
-        input_batch = appended_tokens.repeat(batch_size, 1)
-        attn_mask = torch.ones(batch_size, context_len + appended_tokens.size(1), dtype=torch.long, device=prefix.device)
-        gold_targets = gold_repeat_template.repeat(batch_size, 1)
+        attn_mask = torch.ones(1, context_len + appended_tokens.size(1), dtype=torch.long, device=device)
 
         outputs = model(
-            input_ids=input_batch,
+            input_ids=appended_tokens,
             attention_mask=attn_mask,
-            past_key_values=stacked_cache,
+            past_key_values=cache_trimmed,
             use_cache=True,
         )
 
         logits_gold = outputs.logits[:, 1:, :]
-        s_pred_group = gather_token_logprobs_from_logits(logits_gold, gold_targets)
-        r_per_token = s_pred_group - s_ema.unsqueeze(0)
-        discounted = (r_per_token * discounts.unsqueeze(0)).sum(dim=1)
+        s_pred = gather_token_logprobs_from_logits(logits_gold, gold_window)
+        r_per_token = s_pred.squeeze(0) - s_ema
+        R = torch.sum(r_per_token * discounts)
+        returns.append(R)
 
-        for (idx, _), R in zip(entries, discounted):
-            returns[idx] = R
+    if not returns:
+        return torch.empty(0, device=device, dtype=s_ema.dtype)
 
-    return returns
+    return torch.stack(returns)
 
 def compute_surrogate_loss(per_rollout_thought_logprobs_new, per_rollout_thought_logprobs_old, advantages):
     surrogate_loss = 0
@@ -438,40 +430,6 @@ def select_cache_for_batch(full_cache, batch_idx: int, length: int | None = None
     return DynamicCache.from_legacy_cache(tuple(selected_layers))
 
 
-def stack_caches(cache_list: List[DynamicCache]) -> DynamicCache:
-    """Stack a list of single-example caches along the batch dimension."""
-    if not cache_list:
-        return DynamicCache()
-
-    legacy_layers = []
-    for cache in cache_list:
-        if isinstance(cache, DynamicCache):
-            legacy_layers.append(cache.to_legacy_cache())
-        else:
-            legacy_layers.append(cache)
-
-    num_layers = len(legacy_layers[0])
-    stacked_layers = []
-    for layer_idx in range(num_layers):
-        layer_keys: List[torch.Tensor] = []
-        layer_values: List[torch.Tensor] = []
-        for layer in legacy_layers:
-            keys, values = layer[layer_idx]
-            if keys is None or keys.numel() == 0:
-                layer_keys = []
-                break
-            layer_keys.append(keys)
-            layer_values.append(values)
-
-        if not layer_keys:
-            stacked_layers.append((None, None))
-            continue
-
-        stacked_layers.append((torch.cat(layer_keys, dim=0), torch.cat(layer_values, dim=0)))
-
-    return DynamicCache.from_legacy_cache(tuple(stacked_layers))
-
-
 def collect_prefix_caches(model, input_ids, positions):
     """Build KV caches for specified prefix lengths via a single forward pass."""
     if not positions:
@@ -525,11 +483,13 @@ def log_sampled_thought(step_idx: int, position: int, rollout_idx: int, cot_toke
 print("Loading model...")
 attn_implementation = "flash_attention_2" if USE_FLASH_ATTN else "eager"
 model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, attn_implementation=attn_implementation, trust_remote_code=True).to(DEVICE)
+model = model.to(dtype=DTYPE)
 model.config.use_flash_attention = USE_FLASH_ATTN
+model.gradient_checkpointing_enable()
 
 if COMPILE_MODEL:
     print("Compiling model...")
-    model = torch.compile(model)
+    model = torch.compile(model, mode="reduce-overhead")
 
 ema_model = copy.deepcopy(model).to(DEVICE)
 for p in ema_model.parameters():
@@ -650,7 +610,7 @@ for batch_raw in loop:
     for epoch in range(PPO_EPOCHS):
         batch_rewards = []
         batch_surrogate_losses = []
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
 
         for prefix, gold_window, rollouts_ct, per_rollout_thought_logprobs_old, s_ema_per_token, rollout_advantages in zip(
             batch_prefixes, batch_targets, batch_cts, batch_logp_old, batch_s_ema_per_token, batch_advantages

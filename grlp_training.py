@@ -1,13 +1,13 @@
 """
 Generalized RLP prototype (discounted-return advantage estimation)
 - Model: Qwen/Qwen3-0.6B-Base (or any causal LM)
-- Dataset: allenai/dolma (use a small subset for testing)
+- Dataset: HuggingFaceFW/fineweb (use a small subset for testing)
 """
 
 import copy
 import os
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -73,6 +73,96 @@ def print_gpu_memory(prefix: str) -> None:
         f"{prefix} GPU memory - allocated: {allocated:.1f} MB, "
         f"reserved: {reserved:.1f} MB, total: {total:.1f} MB"
     )
+
+
+def release_cuda_cache() -> None:
+    """Release cached CUDA memory if available."""
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def to_cpu_pinned(tensor: torch.Tensor) -> torch.Tensor:
+    """Detach and move tensor to pinned CPU memory for async transfers."""
+    return tensor.detach().to("cpu", non_blocking=True).pin_memory()
+
+
+class PackedRolloutBuffer:
+    __slots__ = ("tokens", "logps", "lengths", "num_rollouts", "max_seq_len")
+
+    def __init__(self, tokens: torch.Tensor, logps: torch.Tensor, lengths: torch.Tensor) -> None:
+        self.tokens = tokens
+        self.logps = logps
+        self.lengths = lengths
+        self.num_rollouts = 0
+        self.max_seq_len = 0
+
+    def views(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return (
+            self.tokens[: self.num_rollouts, : self.max_seq_len],
+            self.logps[: self.num_rollouts, : self.max_seq_len],
+            self.lengths[: self.num_rollouts],
+        )
+
+
+_ROLLOUT_BUFFER_POOL: List[PackedRolloutBuffer] = []
+
+
+def acquire_rollout_buffer(num_rollouts: int, max_seq_len: int, logp_dtype: torch.dtype) -> PackedRolloutBuffer:
+    target_seq_len = max(1, max_seq_len)
+    for idx, buffer in enumerate(_ROLLOUT_BUFFER_POOL):
+        if (
+            buffer.tokens.size(0) >= num_rollouts
+            and buffer.tokens.size(1) >= target_seq_len
+            and buffer.logps.dtype == logp_dtype
+        ):
+            return _ROLLOUT_BUFFER_POOL.pop(idx)
+
+    tokens = torch.empty((num_rollouts, target_seq_len), dtype=torch.long, pin_memory=True)
+    logps = torch.empty((num_rollouts, target_seq_len), dtype=logp_dtype, pin_memory=True)
+    lengths = torch.empty((num_rollouts,), dtype=torch.int32, pin_memory=True)
+    return PackedRolloutBuffer(tokens, logps, lengths)
+
+
+def release_rollout_buffer(buffer: PackedRolloutBuffer) -> None:
+    buffer.num_rollouts = 0
+    buffer.max_seq_len = 0
+    _ROLLOUT_BUFFER_POOL.append(buffer)
+
+
+def pack_rollout_tensors(
+    cot_tokens: List[torch.Tensor],
+    logprobs: List[torch.Tensor],
+) -> PackedRolloutBuffer:
+    """Pack variable-length rollout tensors into reusable pinned CPU buffers."""
+    if not cot_tokens:
+        return acquire_rollout_buffer(0, 1, torch.float32)
+
+    num_rollouts = len(cot_tokens)
+    lengths_list = [ct.size(1) for ct in cot_tokens]
+    max_seq_len = max(lengths_list, default=0)
+    logp_dtype = logprobs[0].dtype if logprobs else torch.float32
+    buffer = acquire_rollout_buffer(num_rollouts, max_seq_len, logp_dtype)
+
+    pad_value = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+    active_seq_len = max(1, max_seq_len)
+    buffer.tokens[:num_rollouts, :active_seq_len].fill_(pad_value)
+    buffer.logps[:num_rollouts, :active_seq_len].zero_()
+
+    for idx, (ct, lp) in enumerate(zip(cot_tokens, logprobs)):
+        seq_cpu = ct.squeeze(0).detach().to("cpu", non_blocking=True)
+        lp_cpu = lp.detach().to("cpu", non_blocking=True).to(logp_dtype)
+        seq_len = seq_cpu.size(0)
+        if seq_len > 0:
+            buffer.tokens[idx, :seq_len].copy_(seq_cpu)
+            buffer.logps[idx, :seq_len].copy_(lp_cpu)
+        buffer.lengths[idx] = seq_len
+
+    if num_rollouts < buffer.lengths.size(0):
+        buffer.lengths[num_rollouts:] = 0
+
+    buffer.num_rollouts = num_rollouts
+    buffer.max_seq_len = max_seq_len
+    return buffer
 
 
 # -----------------------------
@@ -403,7 +493,11 @@ def slice_cache_to_length(full_cache, length: int) -> DynamicCache:
             truncated_layers.append((keys, values))
             continue
         limit = min(keys.size(-2), length)
-        truncated_layers.append((keys[:, :, :limit, :].contiguous(), values[:, :, :limit, :].contiguous()))
+        # Clone tensors to avoid CUDA graph issues
+        truncated_layers.append((
+            keys[:, :, :limit, :].clone().contiguous(), 
+            values[:, :, :limit, :].clone().contiguous()
+        ))
 
     return DynamicCache.from_legacy_cache(tuple(truncated_layers))
 
@@ -420,6 +514,7 @@ def select_cache_for_batch(full_cache, batch_idx: int, length: int | None = None
         if keys is None or keys.numel() == 0:
             selected_layers.append((keys, values))
             continue
+        # Clone tensors to avoid CUDA graph issues
         keys_sel = keys[batch_idx : batch_idx + 1].clone()
         values_sel = values[batch_idx : batch_idx + 1].clone()
         if length is not None:
@@ -488,13 +583,13 @@ model = model.to(dtype=DTYPE)
 model.config.use_flash_attention = USE_FLASH_ATTN
 model.gradient_checkpointing_enable()
 
-if COMPILE_MODEL:
-    print("Compiling model...")
-    model = torch.compile(model, mode="reduce-overhead")
-
 ema_model = copy.deepcopy(model).to(DEVICE)
 for p in ema_model.parameters():
     p.requires_grad_(False)
+
+if COMPILE_MODEL:
+    print("Compiling model...")
+    model = torch.compile(model, dynamic=True)
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
 
@@ -509,7 +604,7 @@ else:
     ds = Dataset.from_list(list(ds))
     ds.save_to_disk(DATA_CACHE_DIR)
     
-loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=lambda x: x) # no shuffle for streaming dataset
+ds = ds.shuffle(seed=42)
 
 # reset log for new training run
 DEBUG_LOG_PATH.write_text("", encoding="utf-8")
@@ -527,10 +622,8 @@ metric_history = {
 # -----------------------------
 model.train()
 global_step = 0
-loop = tqdm(loader, desc="GRLP Training", total=len(ds) // BATCH_SIZE)
-for batch_raw in loop:
-    # collate: batch_raw is a list of dataset items; we handle batch size 1 primarily
-    item = batch_raw[0]
+progress = tqdm(ds, desc="GRLP Training")
+for item in progress:
     full_input_ids = torch.tensor(item["input_ids"], dtype=torch.long).unsqueeze(0).to(DEVICE)  # (1, L)
     L = full_input_ids.size(1)
     # choose some positions t to apply RLP on in this example: for fast debug pick a few
@@ -549,8 +642,7 @@ for batch_raw in loop:
     batch_cot_lengths = []
     batch_prefixes = []
     batch_targets = []
-    batch_cts = []
-    batch_logp_old = []
+    batch_rollout_buffers = []
     batch_s_ema_per_token = []
     
     # For each selected position t, compute G rollouts and log probs under old_theta
@@ -581,26 +673,31 @@ for batch_raw in loop:
         # Drop rollout caches to avoid holding GPU references beyond this point
         del rollout_caches
 
-        # Move rollout artifacts to CPU to free VRAM until PPO phase
-        rollouts_ct_cpu = [ct.detach().cpu() for ct in rollouts_ct]
-        logp_old_cpu = [logp.detach().cpu() for logp in per_rollout_thought_logprobs_old]
-        s_ema_cpu = s_ema_per_token.detach().cpu()
-        reasoning_prefix_cpu = reasoning_prefix.detach().cpu()
-        gold_window_cpu = gold_window.detach().cpu()
+        # Move rollout artifacts to pinned CPU buffers to free VRAM until PPO phase
+        rollout_buffer = pack_rollout_tensors(
+            rollouts_ct,
+            per_rollout_thought_logprobs_old,
+        )
+        s_ema_cpu = to_cpu_pinned(s_ema_per_token)
+        reasoning_prefix_cpu = to_cpu_pinned(reasoning_prefix)
+        gold_window_cpu = to_cpu_pinned(gold_window)
 
         # Compute group-relative advantages (Eq.7)
         r_mean = returns.mean()
         # advantage scaling factor G/(G-1)
         advantages = (G / (G - 1)) * (returns - r_mean)  # shape (G,)
 
-        batch_advantages.append(advantages.detach().cpu())
-        batch_rewards.append(returns.detach().cpu())
+        batch_advantages.append(to_cpu_pinned(advantages))
+        batch_rewards.append(to_cpu_pinned(returns))
         batch_prefixes.append(reasoning_prefix_cpu)
         batch_targets.append(gold_window_cpu)
-        batch_cts.append(rollouts_ct_cpu)
-        batch_logp_old.append(logp_old_cpu)
+        batch_rollout_buffers.append(rollout_buffer)
         batch_s_ema_per_token.append(s_ema_cpu)
-        batch_cot_lengths.append(float(sum(ct.size(1) for ct in rollouts_ct_cpu) / G))
+        lengths_view = rollout_buffer.lengths[: rollout_buffer.num_rollouts]
+        if lengths_view.numel():
+            batch_cot_lengths.append(float(lengths_view.to(torch.float32).mean().item()))
+        else:
+            batch_cot_lengths.append(0.0)
 
         # Remove GPU tensors from scope
         del prefix
@@ -611,18 +708,20 @@ for batch_raw in loop:
         del s_ema_per_token
         del returns
         del advantages
-        torch.cuda.empty_cache()
 
     prefix_cache_map.clear()
     del prefix_cache_map
     del ema_token_logprobs_full
-    torch.cuda.empty_cache()
+    release_cuda_cache()
 
     if not batch_rewards:
+        for buffer in batch_rollout_buffers:
+            release_rollout_buffer(buffer)
+        batch_rollout_buffers.clear()
         print("No valid rollouts in batch, skipping...")
         continue
 
-    batch_rewards = torch.stack(batch_rewards)
+    batch_rewards = torch.stack(batch_rewards).float()
     avg_reward = float(batch_rewards.mean())
     metric_history["reward"].append(avg_reward)
     metric_history["reward_std"].append(float(batch_rewards.std()))
@@ -634,29 +733,39 @@ for batch_raw in loop:
     avg_loss = 0.0
     # For each selected position t, compute G rollouts and returns; then accumulate surrogate losses
     for epoch in range(PPO_EPOCHS):
-        batch_rewards = []
         batch_surrogate_losses = []
         optimizer.zero_grad(set_to_none=True)
 
-        for prefix, gold_window, rollouts_ct, per_rollout_thought_logprobs_old, s_ema_per_token, rollout_advantages in zip(
-            batch_prefixes, batch_targets, batch_cts, batch_logp_old, batch_s_ema_per_token, batch_advantages
+        for prefix_cpu, gold_window_cpu, rollout_buffer, _, rollout_advantages_cpu in zip(
+            batch_prefixes, batch_targets, batch_rollout_buffers, batch_s_ema_per_token, batch_advantages
         ):
 
-            prefix = prefix.to(DEVICE)
-            gold_window = gold_window.to(DEVICE)
-            rollouts_ct = [ct.to(DEVICE) for ct in rollouts_ct]
-            per_rollout_thought_logprobs_old = [logp.to(DEVICE) for logp in per_rollout_thought_logprobs_old]
-            rollout_advantages = rollout_advantages.to(DEVICE)
+            prefix = prefix_cpu.to(DEVICE, non_blocking=True)
+            gold_window = gold_window_cpu.to(DEVICE, non_blocking=True)
+            tokens_cpu_view, logp_cpu_view, lengths_cpu_view = rollout_buffer.views()
+            tokens_buffer = tokens_cpu_view.to(DEVICE, non_blocking=True)
+            logp_buffer = logp_cpu_view.to(DEVICE, non_blocking=True)
+            lengths_list = lengths_cpu_view.tolist()
+            rollout_advantages = rollout_advantages_cpu.to(DEVICE, non_blocking=True)
+            del prefix_cpu
+            del gold_window_cpu
+            del rollout_advantages_cpu
 
             # - compute reasoned per-token logprobs s_pred^i for horizon H under current model conditioned on prefix + c_t + gold_window
             per_rollout_thought_logprobs_new = []  # per-rollout per-token logprobs under current model for thought tokens
-            for i in range(len(rollouts_ct)):
-                ct_tokens = rollouts_ct[i]         # shape (1, C)
+            per_rollout_thought_logprobs_old = []
+            for i, length in enumerate(lengths_list):
+                if length == 0:
+                    per_rollout_thought_logprobs_new.append(logp_buffer.new_empty((0,), device=logp_buffer.device))
+                    per_rollout_thought_logprobs_old.append(logp_buffer[i, :0])
+                    continue
+                ct_tokens = tokens_buffer[i, :length].unsqueeze(0)
                 # Build input: prefix + cot_tokens + gold_window
                 inp_thought = torch.cat([prefix, ct_tokens], dim=1)  # (1, P+C)
                 # compute per-token log-probs under current model for cot_tokens
                 per_token_logp_new = compute_teacher_forced_logprobs(model, inp_thought, ct_tokens)  # (C,)
                 per_rollout_thought_logprobs_new.append(per_token_logp_new)  # (C,)
+                per_rollout_thought_logprobs_old.append(logp_buffer[i, :length])
 
             surrogate_loss = compute_surrogate_loss(
                 per_rollout_thought_logprobs_new,
@@ -668,11 +777,14 @@ for batch_raw in loop:
 
             del prefix
             del gold_window
-            del rollouts_ct
-            del per_rollout_thought_logprobs_old
+            del tokens_buffer
+            del logp_buffer
+            del tokens_cpu_view
+            del logp_cpu_view
+            del lengths_cpu_view
             del rollout_advantages
             del per_rollout_thought_logprobs_new
-            torch.cuda.empty_cache()
+            del per_rollout_thought_logprobs_old
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
@@ -685,7 +797,11 @@ for batch_raw in loop:
         "reward": avg_reward,
         "cot_len": avg_cot_length_value,
     }
-    loop.set_postfix(postfix)
+    progress.set_postfix(postfix)
+
+    for buffer in batch_rollout_buffers:
+        release_rollout_buffer(buffer)
+    batch_rollout_buffers.clear()
 
     # EMA update
     with torch.no_grad():
@@ -700,7 +816,7 @@ for batch_raw in loop:
         model.save_pretrained(save_dir)
         tokenizer.save_pretrained(save_dir)
     
-    torch.cuda.empty_cache()
+    release_cuda_cache()
 
 # optional: save checkpoint each epoch
 save_dir = f"{MODEL_NAME.split('/')[-1]}-grlp"

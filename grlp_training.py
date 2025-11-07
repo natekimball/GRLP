@@ -11,7 +11,6 @@ from typing import Dict, List, Tuple
 
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.cache_utils import DynamicCache
 from datasets import load_dataset, Dataset
@@ -55,9 +54,11 @@ USE_FLASH_ATTN = False
 DEBUG_LOG_PATH = Path("debug.txt")
 PLOT_SAVE_INTERVAL = 5
 MODEL_SAVE_INTERVAL = 100
-METRIC_FIG_PATH = Path("simple_grlp_training_metrics.png")
+METRIC_FIG_PATH = Path("grlp_training_metrics.png")
 
 torch.set_float32_matmul_precision('high')
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True  # noqa
 
 def print_gpu_memory(prefix: str) -> None:
     """Log CUDA memory stats if a GPU is available."""
@@ -288,14 +289,14 @@ def compute_returns(rollouts_ct, rollout_caches, prefix, gold_window, model, s_e
     returns = []
     prefix_len = prefix.size(1)
 
-    for ct, cache in zip(rollouts_ct, rollout_caches):
+    for i, ct in enumerate(rollouts_ct):
         ct_len = ct.size(1)
         eos_positions = (ct == tokenizer.eos_token_id).nonzero(as_tuple=False)
         if eos_positions.numel() > 0:
             ct_len = eos_positions[0, 1].item()
 
         context_len = prefix_len + ct_len
-        cache_trimmed = slice_cache_to_length(cache, context_len)
+        cache_trimmed = select_cache_for_batch(rollout_caches, i, context_len)
 
         attn_mask = torch.ones(1, context_len + appended_tokens.size(1), dtype=torch.long, device=device)
 
@@ -462,19 +463,7 @@ def rollout(model, prefix, num_rollouts=G, temperature=0.7, max_new_tokens=THOUG
         rollouts_ct_list.append(tokens.unsqueeze(0))
         per_token_logp_list.append(logps)
 
-    if not isinstance(past_key_values, DynamicCache):
-        final_cache = DynamicCache.from_legacy_cache(past_key_values)
-    else:
-        final_cache = past_key_values
-
-    prefix_len = prefix.size(1)
-    rollout_cache_list = []
-    for i, ct_tokens in enumerate(rollouts_ct_list):
-        total_len = prefix_len + ct_tokens.size(1)
-        cache_i = select_cache_for_batch(final_cache, i, total_len)
-        rollout_cache_list.append(cache_i)
-
-    return rollouts_ct_list, per_token_logp_list, rollout_cache_list
+    return rollouts_ct_list, per_token_logp_list, past_key_values
 
 
 def slice_cache_to_length(full_cache, length: int) -> DynamicCache:
@@ -643,24 +632,21 @@ for item in progress:
     batch_prefixes = []
     batch_targets = []
     batch_rollout_buffers = []
-    batch_s_ema_per_token = []
     
     # For each selected position t, compute G rollouts and log probs under old_theta
     for t in candidate_positions:
         prefix, gold_window = make_prefix_and_gold_from_full_input(full_input_ids, t)  # shapes (1, P-1), (1, H)
-        P = prefix.size(1)
         # TODO: in the future could handle end positions with shorter horizons
-        H_current = gold_window.size(1)
 
-        # prefix_str = tokenizer.decode(prefix[:, -2*H_current:].squeeze(0).tolist())
+        # prefix_str = tokenizer.decode(prefix[:, -2*HORIZON:].squeeze(0).tolist())
         # target_str = tokenizer.decode(gold_window.squeeze(0).tolist())
 
         ema_start = t - 1  # logits index predicting token at position t
-        ema_end = ema_start + H_current
+        ema_end = ema_start + HORIZON
         s_ema_per_token = ema_token_logprobs_full[ema_start:ema_end]
 
         reasoning_prefix = torch.cat([prefix, start_thought_id], dim=1)  # (1, P)
-        cache_for_prefix = prefix_cache_map.get(P)
+        cache_for_prefix = prefix_cache_map.get(t)
         rollouts_ct, per_rollout_thought_logprobs_old, rollout_caches = rollout(
             model,
             reasoning_prefix,
@@ -672,13 +658,13 @@ for item in progress:
 
         # Drop rollout caches to avoid holding GPU references beyond this point
         del rollout_caches
+        del s_ema_per_token
 
         # Move rollout artifacts to pinned CPU buffers to free VRAM until PPO phase
         rollout_buffer = pack_rollout_tensors(
             rollouts_ct,
             per_rollout_thought_logprobs_old,
         )
-        s_ema_cpu = to_cpu_pinned(s_ema_per_token)
         reasoning_prefix_cpu = to_cpu_pinned(reasoning_prefix)
         gold_window_cpu = to_cpu_pinned(gold_window)
 
@@ -692,7 +678,6 @@ for item in progress:
         batch_prefixes.append(reasoning_prefix_cpu)
         batch_targets.append(gold_window_cpu)
         batch_rollout_buffers.append(rollout_buffer)
-        batch_s_ema_per_token.append(s_ema_cpu)
         lengths_view = rollout_buffer.lengths[: rollout_buffer.num_rollouts]
         if lengths_view.numel():
             batch_cot_lengths.append(float(lengths_view.to(torch.float32).mean().item()))
@@ -705,7 +690,6 @@ for item in progress:
         del per_rollout_thought_logprobs_old
         del reasoning_prefix
         del gold_window
-        del s_ema_per_token
         del returns
         del advantages
 
@@ -736,8 +720,8 @@ for item in progress:
         batch_surrogate_losses = []
         optimizer.zero_grad(set_to_none=True)
 
-        for prefix_cpu, gold_window_cpu, rollout_buffer, _, rollout_advantages_cpu in zip(
-            batch_prefixes, batch_targets, batch_rollout_buffers, batch_s_ema_per_token, batch_advantages
+        for prefix_cpu, gold_window_cpu, rollout_buffer, rollout_advantages_cpu in zip(
+            batch_prefixes, batch_targets, batch_rollout_buffers, batch_advantages
         ):
 
             prefix = prefix_cpu.to(DEVICE, non_blocking=True)

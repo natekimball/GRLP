@@ -6,6 +6,8 @@ Generalized RLP prototype (discounted-return advantage estimation)
 
 import copy
 import os
+import atexit
+from concurrent.futures import ThreadPoolExecutor, Future
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -59,6 +61,36 @@ METRIC_FIG_PATH = Path("grlp_training_metrics.png")
 torch.set_float32_matmul_precision('high')
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True  # noqa
+
+
+_BACKGROUND_EXECUTOR = ThreadPoolExecutor(max_workers=1)
+_BACKGROUND_FUTURES: List[Future] = []
+_EXECUTOR_SHUT_DOWN = False
+
+
+def _clear_completed_futures() -> None:
+    _BACKGROUND_FUTURES[:] = [f for f in _BACKGROUND_FUTURES if not f.done()]
+
+
+def submit_background_task(fn, *args, **kwargs) -> Future:
+    if _EXECUTOR_SHUT_DOWN:
+        raise RuntimeError("Background executor already shut down")
+    _clear_completed_futures()
+    future = _BACKGROUND_EXECUTOR.submit(fn, *args, **kwargs)
+    _BACKGROUND_FUTURES.append(future)
+    return future
+
+
+def wait_for_background_tasks() -> None:
+    global _EXECUTOR_SHUT_DOWN
+    while _BACKGROUND_FUTURES:
+        _BACKGROUND_FUTURES.pop(0).result()
+    if not _EXECUTOR_SHUT_DOWN:
+        _BACKGROUND_EXECUTOR.shutdown(wait=True)
+        _EXECUTOR_SHUT_DOWN = True
+
+
+atexit.register(wait_for_background_tasks)
 
 def print_gpu_memory(prefix: str) -> None:
     """Log CUDA memory stats if a GPU is available."""
@@ -170,7 +202,7 @@ def pack_rollout_tensors(
 # Helpers
 # -----------------------------
 
-def save_metric_plot(metrics: Dict[str, List[float]]) -> None:
+def _save_metric_plot(metrics: Dict[str, List[float]]) -> None:
     reward_history = metrics["reward"]
     reward_std_history = metrics["reward_std"]
     cot_length_history = metrics["cot_length"]
@@ -198,6 +230,47 @@ def save_metric_plot(metrics: Dict[str, List[float]]) -> None:
     fig.tight_layout()
     fig.savefig(METRIC_FIG_PATH, bbox_inches="tight")
     plt.close(fig)
+
+
+def save_metric_plot(metrics: Dict[str, List[float]]) -> None:
+    reward_history = metrics.get("reward")
+    if not reward_history:
+        return
+    metrics_snapshot = {key: list(values) for key, values in metrics.items()}
+    submit_background_task(_save_metric_plot, metrics_snapshot)
+
+
+def _save_model_checkpoint(
+    save_dir: Path,
+    state_dict: Dict[str, torch.Tensor],
+    config,
+    generation_config,
+    tokenizer,
+) -> None:
+    save_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(state_dict, save_dir / "pytorch_model.bin")
+    config.save_pretrained(save_dir)
+    if generation_config is not None:
+        generation_config.save_pretrained(save_dir)
+    tokenizer.save_pretrained(save_dir)
+
+
+def schedule_model_save(model, tokenizer, save_dir: str | Path) -> None:
+    save_path = Path(save_dir)
+    with torch.no_grad():
+        state_dict = model.state_dict()
+        for key, value in state_dict.items():
+            state_dict[key] = value.detach().to("cpu", copy=True)
+    config_copy = copy.deepcopy(model.config)
+    generation_config_copy = copy.deepcopy(getattr(model, "generation_config", None))
+    submit_background_task(
+        _save_model_checkpoint,
+        save_path,
+        state_dict,
+        config_copy,
+        generation_config_copy,
+        tokenizer,
+    )
 
 @contextmanager
 def inference_context(model, with_grad: bool = False, inference_mode: bool = False):
@@ -797,17 +870,17 @@ for item in progress:
     
     if global_step and global_step % MODEL_SAVE_INTERVAL == 0:
         save_dir = f"{MODEL_NAME.split('/')[-1]}-grlp-step{global_step}"
-        model.save_pretrained(save_dir)
-        tokenizer.save_pretrained(save_dir)
+        schedule_model_save(model, tokenizer, save_dir)
     
     release_cuda_cache()
 
 # optional: save checkpoint each epoch
 save_dir = f"{MODEL_NAME.split('/')[-1]}-grlp"
-model.save_pretrained(save_dir)
-tokenizer.save_pretrained(save_dir)
+schedule_model_save(model, tokenizer, save_dir)
 
 save_metric_plot(metric_history)
+
+wait_for_background_tasks()
 
 print_gpu_memory("Post-training")
 

@@ -52,7 +52,7 @@ PPO_EPOCHS = 3                          # number of policy optimization iteratio
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.bfloat16
 COMPILE_MODEL = True
-USE_FLASH_ATTN = False
+USE_FLASH_ATTN = True
 
 DEBUG_LOG_PATH = Path("debug.txt")
 PLOT_SAVE_INTERVAL = 5
@@ -624,8 +624,7 @@ def log_sampled_thought(step_idx: int, position: int, rollout_idx: int, cot_toke
 
 print("Loading model...")
 attn_implementation = "flash_attention_2" if USE_FLASH_ATTN else "eager"
-model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, attn_implementation=attn_implementation, trust_remote_code=True).to(DEVICE)
-model = model.to(dtype=DTYPE)
+model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, attn_implementation=attn_implementation, trust_remote_code=True, dtype=DTYPE).to(DEVICE)
 model.config.use_flash_attention = USE_FLASH_ATTN
 model.gradient_checkpointing_enable()
 

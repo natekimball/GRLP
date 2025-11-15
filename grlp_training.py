@@ -1,6 +1,6 @@
 """
 Generalized RLP prototype (discounted-return advantage estimation)
-- Model: Qwen/Qwen3-0.6B-Base (or any causal LM)
+- Model: Qwen/Qwen3-1.7B-Base (or any causal LM)
 - Dataset: HuggingFaceFW/fineweb (use a small subset for testing)
 """
 
@@ -29,7 +29,8 @@ from contextlib import contextmanager
 # -----------------------------
 # Parse command line arguments
 parser = argparse.ArgumentParser(description="Generalized RLP prototype training")
-parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-0.6B-Base", help="Model name or path to saved model")
+parser.add_argument("--model-name", type=str, default="Qwen/Qwen3-1.7B-Base", help="Model name or path to saved model")
+parser.add_argument("--plot-path", type=str, default="grlp-plots.png", help="Path to save metric plots")
 args = parser.parse_args()
 
 MODEL_NAME = args.model_name
@@ -56,12 +57,11 @@ USE_FLASH_ATTN = False
 DEBUG_LOG_PATH = Path("debug.txt")
 PLOT_SAVE_INTERVAL = 5
 MODEL_SAVE_INTERVAL = 100
-METRIC_FIG_PATH = Path("grlp_training_metrics.png")
+METRIC_FIG_PATH = Path(args.plot_path)
 
 torch.set_float32_matmul_precision('high')
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True  # noqa
-
 
 _BACKGROUND_EXECUTOR = ThreadPoolExecutor(max_workers=1)
 _BACKGROUND_FUTURES: List[Future] = []
@@ -240,6 +240,7 @@ def save_metric_plot(metrics: Dict[str, List[float]]) -> None:
     submit_background_task(_save_metric_plot, metrics_snapshot)
 
 
+@torch.no_grad()
 def _save_model_checkpoint(
     save_dir: Path,
     state_dict: Dict[str, torch.Tensor],
@@ -247,6 +248,10 @@ def _save_model_checkpoint(
     generation_config,
     tokenizer,
 ) -> None:
+    state_dict = model.state_dict()
+    for key, value in state_dict.items():
+        state_dict[key] = value.detach().to("cpu", copy=True)
+
     save_dir.mkdir(parents=True, exist_ok=True)
     torch.save(state_dict, save_dir / "pytorch_model.bin")
     config.save_pretrained(save_dir)
@@ -362,11 +367,17 @@ def compute_returns(rollouts_ct, rollout_caches, prefix, gold_window, model, s_e
     returns = []
     prefix_len = prefix.size(1)
 
+    # prefix_str = tokenizer.decode(prefix.squeeze(0).tolist())
+    # gold_str = tokenizer.decode(gold_window.squeeze(0).tolist())
+
     for i, ct in enumerate(rollouts_ct):
         ct_len = ct.size(1)
         eos_positions = (ct == tokenizer.eos_token_id).nonzero(as_tuple=False)
         if eos_positions.numel() > 0:
             ct_len = eos_positions[0, 1].item()
+
+        # log_sampled_thought(global_step, None, i, ct.unsqueeze(0), prefix_str, gold_str)
+        # log_sampled_thought(global_step, None, i, torch.cat([ct[:, :ct_len], end_thought_id], dim=1), prefix_str, gold_str)
 
         context_len = prefix_len + ct_len
         cache_trimmed = select_cache_for_batch(rollout_caches, i, context_len)
@@ -380,7 +391,7 @@ def compute_returns(rollouts_ct, rollout_caches, prefix, gold_window, model, s_e
             use_cache=True,
         )
 
-        logits_gold = outputs.logits[:, 1:, :]
+        logits_gold = outputs.logits[:, :-1, :]
         s_pred = gather_token_logprobs_from_logits(logits_gold, gold_window)
         r_per_token = s_pred.squeeze(0) - s_ema
         R = torch.sum(r_per_token * discounts)
@@ -430,58 +441,30 @@ def rollout(model, prefix, num_rollouts=G, temperature=0.7, max_new_tokens=THOUG
     model.eval()
     eos_token_id = tokenizer.eos_token_id
 
-    if prefix_cache is not None:
-        if isinstance(prefix_cache, tuple):
-            past_key_values = DynamicCache.from_legacy_cache(prefix_cache)
-        else:
-            past_key_values = DynamicCache.from_legacy_cache(prefix_cache.to_legacy_cache())
-        past_key_values.batch_repeat_interleave(num_rollouts)
-
-        # Split prefix into actual document prefix + deterministic think token
-        base_prefix = prefix[:, :-1]
-        think_token = prefix[:, -1:].repeat(num_rollouts, 1)
-
-        generated = base_prefix.repeat(num_rollouts, 1)
-        attention_mask = torch.ones_like(generated)
-        eos_reached = torch.zeros(num_rollouts, dtype=torch.bool, device=generated.device)
-
-        rollouts_ct = torch.full((num_rollouts, 0), fill_value=0, dtype=torch.long, device=generated.device)
-        per_token_logp = torch.empty(num_rollouts, 0, dtype=torch.bfloat16, device=generated.device)
-        token_buffer = torch.empty(num_rollouts, 1, dtype=torch.long, device=generated.device)
-
-        attention_mask = torch.cat((attention_mask, torch.ones_like(think_token)), dim=1)
-        out = model(
-            input_ids=think_token,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            use_cache=True
-        )
-        past_key_values = out.past_key_values
-        generated = torch.cat((generated, think_token), dim=1)
-    else:
-        # 1️⃣ Compute prefix KV-cache once
+    base_prefix = prefix[:, :-1]
+    if prefix_cache is None:
         prefix_out = model(
-            input_ids=prefix,
-            attention_mask=torch.ones_like(prefix),
+            input_ids=base_prefix,
+            attention_mask=torch.ones_like(base_prefix),
             past_key_values=None,
             use_cache=True
         )
-        prefix_pkv = prefix_out.past_key_values
-        if isinstance(prefix_pkv, tuple):
-            prefix_pkv = DynamicCache.from_legacy_cache(prefix_pkv)
-        prefix_pkv.batch_repeat_interleave(num_rollouts)
-        past_key_values = prefix_pkv
+        cache_copy = DynamicCache.from_legacy_cache(prefix_out.past_key_values)
+    else:
+        legacy_cache = prefix_cache if isinstance(prefix_cache, tuple) else prefix_cache.to_legacy_cache()
+        cache_copy = DynamicCache.from_legacy_cache(legacy_cache)
 
-        # 3️⃣ Initialize rollout state
-        generated = prefix.repeat(num_rollouts, 1)
-        attention_mask = torch.ones_like(generated)
-        eos_reached = torch.zeros(num_rollouts, dtype=torch.bool, device=generated.device)
+    # 3️⃣ Initialize rollout state
+    past_key_values = cache_copy.batch_repeat_interleave(num_rollouts)
+    generated = prefix.repeat(num_rollouts, 1)
+    attention_mask = torch.ones_like(generated)
+    eos_reached = torch.zeros(num_rollouts, dtype=torch.bool, device=generated.device)
 
-        rollouts_ct = torch.full((num_rollouts, 0), fill_value=0, dtype=torch.long, device=generated.device)
-        per_token_logp = torch.empty(num_rollouts, 0, dtype=torch.bfloat16, device=generated.device)
+    rollouts_ct = torch.full((num_rollouts, 0), fill_value=0, dtype=torch.long, device=generated.device)
+    per_token_logp = torch.empty(num_rollouts, 0, dtype=torch.bfloat16, device=generated.device)
 
-        # Prealloc temp tensors to avoid reallocations
-        token_buffer = torch.empty(num_rollouts, 1, dtype=torch.long, device=generated.device)
+    # Prealloc temp tensors to avoid reallocations
+    token_buffer = torch.empty(num_rollouts, 1, dtype=torch.long, device=generated.device)
 
     # 4️⃣ Step-by-step autoregressive sampling
     for _ in range(max_new_tokens):
@@ -631,9 +614,10 @@ assert end_thought_id.shape == (1, 1)
 
 def log_sampled_thought(step_idx: int, position: int, rollout_idx: int, cot_tokens: torch.Tensor, prefix: str, target: str) -> None:
     """Append the decoded chain-of-thought sample to the debug log."""
-    decoded = tokenizer.decode(cot_tokens.tolist(), skip_special_tokens=False)
+    token_ids = cot_tokens.reshape(-1).tolist()
+    decoded = tokenizer.decode(token_ids, skip_special_tokens=False)
     with DEBUG_LOG_PATH.open("a", encoding="utf-8") as log_file:
-        log_file.write(f"[step={step_idx} t={position} rollout={rollout_idx} len={cot_tokens.size(0)}]\n")
+        log_file.write(f"[step={step_idx} t={position} rollout={rollout_idx} len={len(token_ids)}]\n")
         log_file.write(f"Prefix: {prefix}\n")
         log_file.write(f"Target: {target}\n")
         log_file.write(repr(decoded) + "\n\n")
@@ -723,6 +707,7 @@ for item in progress:
         rollouts_ct, per_rollout_thought_logprobs_old, rollout_caches = rollout(
             model,
             reasoning_prefix,
+            num_rollouts=G,
             prefix_cache=cache_for_prefix,
         )
 

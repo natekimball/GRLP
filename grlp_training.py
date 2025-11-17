@@ -51,8 +51,9 @@ DATA_CACHE_DIR = Path("data/fineweb-10k-tokenized")
 # PPO_EPOCHS = 2                          # number of policy optimization iterations per batch
 # DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # DTYPE = torch.bfloat16
-# COMPILE_MODEL = True
+# COMPILE_MODEL = False
 # USE_FLASH_ATTN = True
+# TEMPERATURE = 0.7
 
 MAX_SEQ_LEN = 2048
 HORIZON = 8                             # reward horizon T (small for debug; paper uses long)
@@ -68,6 +69,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.bfloat16
 COMPILE_MODEL = False
 USE_FLASH_ATTN = True
+TEMPERATURE = 0.7
 
 DEBUG_LOG_PATH = Path("debug.txt")
 PLOT_SAVE_INTERVAL = 5
@@ -327,7 +329,7 @@ def gather_token_logprobs_from_logits(logits, target_ids):
     return logprobs.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
 
 
-def compute_teacher_forced_logprobs(model, input_ids, gold_targets, *, keep_grad=True, inference_mode=False):
+def compute_teacher_forced_logprobs(model, input_ids, gold_targets, *, temperature=1.0, keep_grad=True, inference_mode=False):
     """
     Compute per-token log-probs under teacher forcing for the sequence:
       model(input_ids) where input_ids = prefix + optional cot + gold_seq
@@ -357,7 +359,7 @@ def compute_teacher_forced_logprobs(model, input_ids, gold_targets, *, keep_grad
     # select logits corresponding to predictions for gold tokens:
     logits_for_gold = outputs[:, start_idx:end_idx, :]   # (1, H, V)
     # targets for those positions are exactly gold_targets (shape (1, H))
-    per_token_logp = gather_token_logprobs_from_logits(logits_for_gold, gold_targets)
+    per_token_logp = gather_token_logprobs_from_logits(logits_for_gold / temperature, gold_targets)
     # shape (1, H) -> squeeze
     result = per_token_logp.squeeze(0)  # (H,)
     return result if keep_grad else result.detach()
@@ -444,12 +446,12 @@ def compute_surrogate_loss(per_rollout_thought_logprobs_new, per_rollout_thought
 
 
 @torch.no_grad()
-def rollout(model, prefix, num_rollouts=G, temperature=0.7, max_new_tokens=THOUGHT_MAX_TOKENS, prefix_cache=None):
+def rollout(model, prefix, num_rollouts=G, temperature=TEMPERATURE, max_new_tokens=THOUGHT_MAX_TOKENS, prefix_cache=None):
     """
     Optimized rollout generation:
       - Computes prefix cache once
       - Samples G rollouts in parallel (temperature 0.7)
-      - Collects both sampled CoT tokens and untempered logprobs
+      - Collects both sampled CoT tokens and logprobs
         Returns:
             rollouts_ct: List[Tensor]  (G, 1, C_i)
             per_rollout_thought_logprobs_old: List[Tensor]  (G, C_i)
@@ -492,18 +494,15 @@ def rollout(model, prefix, num_rollouts=G, temperature=0.7, max_new_tokens=THOUG
             use_cache=True
         )
 
-        logits = out.logits[:, -1, :]  # [G, vocab]
+        logits = out.logits[:, -1, :] / temperature  # [G, vocab]
         past_key_values = out.past_key_values
 
-        # Store untempered log probs for PPO baseline (not divided by temperature)
-        logp_untempered = torch.log_softmax(logits, dim=-1)
-
         # Temperature sampling
-        probs = torch.softmax(logits / temperature, dim=-1)
+        probs = torch.softmax(logits, dim=-1)
         next_tokens = torch.multinomial(probs, num_samples=1, out=token_buffer)
 
         # Record logprobs for chosen tokens
-        chosen_logp = logp_untempered.gather(-1, next_tokens)
+        chosen_logp = torch.log(probs).gather(-1, next_tokens)  # [G, 1]
         per_token_logp = torch.cat((per_token_logp, chosen_logp), dim=1)
 
         # Append new tokens to rollout continuation
@@ -823,7 +822,7 @@ for item in progress:
                 # Build input: prefix + cot_tokens + gold_window
                 inp_thought = torch.cat([prefix, ct_tokens], dim=1)  # (1, P+C)
                 # compute per-token log-probs under current model for cot_tokens
-                per_token_logp_new = compute_teacher_forced_logprobs(model, inp_thought, ct_tokens)  # (C,)
+                per_token_logp_new = compute_teacher_forced_logprobs(model, inp_thought, ct_tokens, temperature=TEMPERATURE)  # (C,)
                 per_rollout_thought_logprobs_new.append(per_token_logp_new)  # (C,)
                 per_rollout_thought_logprobs_old.append(logp_buffer[i, :length])
 

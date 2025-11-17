@@ -39,6 +39,21 @@ SPLIT = "train"
 N_DATA = 10_000
 DATA_CACHE_DIR = Path("data/fineweb-10k-tokenized")
 
+# MAX_SEQ_LEN = 512
+# HORIZON = 8                             # reward horizon T (small for debug; paper uses long)
+# THOUGHT_MAX_TOKENS = 512
+# G = 2                                   # number of rollouts per context
+# GAMMA = 0.7                             # discount factor
+# BATCH_SIZE = 2                          # token-level RLP is expensive; tune for your memory
+# LR = 1e-6
+# TAU = 0.999                             # EMA decay
+# EPS_CLIP_LOW, EPS_CLIP_HIGH = 0.1, 0.1  # PPO clipping
+# PPO_EPOCHS = 2                          # number of policy optimization iterations per batch
+# DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+# DTYPE = torch.bfloat16
+# COMPILE_MODEL = True
+# USE_FLASH_ATTN = True
+
 MAX_SEQ_LEN = 2048
 HORIZON = 8                             # reward horizon T (small for debug; paper uses long)
 THOUGHT_MAX_TOKENS = 2048
@@ -51,7 +66,7 @@ EPS_CLIP_LOW, EPS_CLIP_HIGH = 0.1, 0.1  # PPO clipping
 PPO_EPOCHS = 3                          # number of policy optimization iterations per batch
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.bfloat16
-COMPILE_MODEL = True
+COMPILE_MODEL = False
 USE_FLASH_ATTN = True
 
 DEBUG_LOG_PATH = Path("debug.txt")
@@ -59,9 +74,11 @@ PLOT_SAVE_INTERVAL = 5
 MODEL_SAVE_INTERVAL = 100
 METRIC_FIG_PATH = Path(args.plot_path)
 
+#os.environ["TORCH_LOGS"] = "recompiles"
 torch.set_float32_matmul_precision('high')
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True  # noqa
+torch._dynamo.config.allow_unspec_int_on_nn_module = True
 
 _BACKGROUND_EXECUTOR = ThreadPoolExecutor(max_workers=1)
 _BACKGROUND_FUTURES: List[Future] = []
@@ -634,7 +651,9 @@ for p in ema_model.parameters():
 
 if COMPILE_MODEL:
     print("Compiling model...")
-    model = torch.compile(model, dynamic=True)
+    model = torch.compile(model, mode="max-autotune", dynamic=True)
+    # model = torch.compile(model, mode="max-autotune-no-cudagraphs", fullgraph=False, dynamic=True)
+    # model = torch.compile(model, mode="max-autotune-no-cudagraphs", fullgraph=False)
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
 

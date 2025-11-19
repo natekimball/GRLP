@@ -39,37 +39,37 @@ SPLIT = "train"
 N_DATA = 10_000
 DATA_CACHE_DIR = Path("data/fineweb-10k-tokenized")
 
-# MAX_SEQ_LEN = 512
-# HORIZON = 8                             # reward horizon T (small for debug; paper uses long)
-# THOUGHT_MAX_TOKENS = 512
-# G = 2                                   # number of rollouts per context
-# GAMMA = 0.7                             # discount factor
-# BATCH_SIZE = 2                          # token-level RLP is expensive; tune for your memory
-# LR = 1e-6
-# TAU = 0.999                             # EMA decay
-# EPS_CLIP_LOW, EPS_CLIP_HIGH = 0.1, 0.1  # PPO clipping
-# PPO_EPOCHS = 2                          # number of policy optimization iterations per batch
-# DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-# DTYPE = torch.bfloat16
-# COMPILE_MODEL = False
-# USE_FLASH_ATTN = True
-# TEMPERATURE = 0.7
-
-MAX_SEQ_LEN = 2048
+MAX_SEQ_LEN = 256
 HORIZON = 8                             # reward horizon T (small for debug; paper uses long)
-THOUGHT_MAX_TOKENS = 2048
-G = 16                                  # number of rollouts per context
+THOUGHT_MAX_TOKENS = 256
+G = 2                                   # number of rollouts per context
 GAMMA = 0.7                             # discount factor
-BATCH_SIZE = 16                         # token-level RLP is expensive; tune for your memory
+BATCH_SIZE = 2                          # token-level RLP is expensive; tune for your memory
 LR = 1e-6
 TAU = 0.999                             # EMA decay
 EPS_CLIP_LOW, EPS_CLIP_HIGH = 0.1, 0.1  # PPO clipping
-PPO_EPOCHS = 3                          # number of policy optimization iterations per batch
+PPO_EPOCHS = 2                          # number of policy optimization iterations per batch
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.bfloat16
-COMPILE_MODEL = False
+COMPILE_MODEL = True
 USE_FLASH_ATTN = True
 TEMPERATURE = 0.7
+
+# MAX_SEQ_LEN = 2048
+# HORIZON = 8                             # reward horizon T (small for debug; paper uses long)
+# THOUGHT_MAX_TOKENS = 2048
+# G = 16                                  # number of rollouts per context
+# GAMMA = 0.7                             # discount factor
+# BATCH_SIZE = 16                         # token-level RLP is expensive; tune for your memory
+# LR = 1e-6
+# TAU = 0.999                             # EMA decay
+# EPS_CLIP_LOW, EPS_CLIP_HIGH = 0.1, 0.1  # PPO clipping
+# PPO_EPOCHS = 3                          # number of policy optimization iterations per batch
+# DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+# DTYPE = torch.bfloat16
+# COMPILE_MODEL = True
+# USE_FLASH_ATTN = True
+# TEMPERATURE = 0.7
 
 DEBUG_LOG_PATH = Path("debug.txt")
 PLOT_SAVE_INTERVAL = 5
@@ -421,28 +421,18 @@ def compute_returns(rollouts_ct, rollout_caches, prefix, gold_window, model, s_e
 
     return torch.stack(returns)
 
-def compute_surrogate_loss(per_rollout_thought_logprobs_new, per_rollout_thought_logprobs_old, advantages):
-    surrogate_loss = 0
-    # For each rollout, compute per-thought clipped surrogate loss (Eq.8)
-    for i in range(G):
-        # per-token log probs under new/current (we have per_token_logp_new)
-        logp_new = per_rollout_thought_logprobs_new[i]  # shape (C,)
-        # per-token log probs under old/behavior (we computed earlier in rollouts_logprob_old_tokens)
-        logp_old = per_rollout_thought_logprobs_old[i]      # shape (C,)
-        # importance ratios per token
-        log_rhos = logp_new - logp_old.to(logp_new.device)  # (C,)
-        rhos = torch.exp(log_rhos)                           # (C,)
-        # clip
-        clip_rhos = torch.clamp(rhos, 1.0 - EPS_CLIP_LOW, 1.0 + EPS_CLIP_HIGH)
-        A = advantages[i]  # scalar
-        # surrogate per token: min(rho * sg(A), clip(rho) * sg(A))
-        # negative sign because we maximize reward -> minimize negative surrogate
-        # Also divide by |c| as in Eq.8
-        surrogate_per_token = torch.min(rhos * A.detach(), clip_rhos * A.detach())
-        loss_i = - surrogate_per_token.mean()  # scalar
-        surrogate_loss += loss_i
-
-    return surrogate_loss / G
+def compute_surrogate_loss(logp_new, logp_old, advantage):
+    # compute per-thought clipped surrogate loss (Eq.8)
+    # importance ratios per token
+    log_rhos = logp_new - logp_old.to(logp_new.device)  # (C,)
+    rhos = torch.exp(log_rhos)                           # (C,)
+    # clip
+    clip_rhos = torch.clamp(rhos, 1.0 - EPS_CLIP_LOW, 1.0 + EPS_CLIP_HIGH)
+    # surrogate per token: min(rho * sg(A), clip(rho) * sg(A))
+    # negative sign because we maximize reward -> minimize negative surrogate
+    # Also divide by |c| as in Eq.8
+    surrogate_per_token = torch.min(rhos * advantage, clip_rhos * advantage)
+    return - surrogate_per_token.mean()  # scalar
 
 
 @torch.no_grad()
@@ -648,13 +638,16 @@ ema_model = copy.deepcopy(model).to(DEVICE)
 for p in ema_model.parameters():
     p.requires_grad_(False)
 
+# compile_mode = None # set to "max-autotune" for performance
+compile_mode = "max-autotune-no-cudagraphs"
 if COMPILE_MODEL:
     print("Compiling model...")
-    model = torch.compile(model, mode="max-autotune", dynamic=True)
-    # model = torch.compile(model, mode="max-autotune-no-cudagraphs", fullgraph=False, dynamic=True)
-    # model = torch.compile(model, mode="max-autotune-no-cudagraphs", fullgraph=False)
+    compiled_model = torch.compile(model, mode=compile_mode, dynamic=True)
+else:
+    compiled_model = model
+ema_model = torch.compile(ema_model, mode=compile_mode, dynamic=True)
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
+optimizer = torch.optim.AdamW(compiled_model.parameters(), lr=LR)
 
 print_gpu_memory("Post-model-load")
 
@@ -811,28 +804,33 @@ for item in progress:
             del rollout_advantages_cpu
 
             # - compute reasoned per-token logprobs s_pred^i for horizon H under current model conditioned on prefix + c_t + gold_window
-            per_rollout_thought_logprobs_new = []  # per-rollout per-token logprobs under current model for thought tokens
-            per_rollout_thought_logprobs_old = []
+            current_batch_item_loss = 0.0
+            
             for i, length in enumerate(lengths_list):
                 if length == 0:
-                    per_rollout_thought_logprobs_new.append(logp_buffer.new_empty((0,), device=logp_buffer.device))
-                    per_rollout_thought_logprobs_old.append(logp_buffer[i, :0])
                     continue
+                
                 ct_tokens = tokens_buffer[i, :length].unsqueeze(0)
                 # Build input: prefix + cot_tokens + gold_window
                 inp_thought = torch.cat([prefix, ct_tokens], dim=1)  # (1, P+C)
                 # compute per-token log-probs under current model for cot_tokens
-                per_token_logp_new = compute_teacher_forced_logprobs(model, inp_thought, ct_tokens, temperature=TEMPERATURE)  # (C,)
-                per_rollout_thought_logprobs_new.append(per_token_logp_new)  # (C,)
-                per_rollout_thought_logprobs_old.append(logp_buffer[i, :length])
 
-            surrogate_loss = compute_surrogate_loss(
-                per_rollout_thought_logprobs_new,
-                per_rollout_thought_logprobs_old,
-                rollout_advantages
-            )
-            surrogate_loss.backward()
-            batch_surrogate_losses.append(float(surrogate_loss.detach().cpu()))
+                torch.compiler.cudagraph_mark_step_begin()
+                per_token_logp_new = compute_teacher_forced_logprobs(compiled_model, inp_thought, ct_tokens, temperature=TEMPERATURE)  # (C,)
+                
+                # Compute loss for this rollout immediately to avoid CUDA graph memory overwrite
+                logp_old = logp_buffer[i, :length]
+                advantage = rollout_advantages[i]
+                
+                loss_i = compute_surrogate_loss(per_token_logp_new, logp_old, advantage)
+                
+                # Backprop immediately (scaled by 1/G)
+                loss_to_backprop = loss_i / G
+                loss_to_backprop.backward()
+                
+                current_batch_item_loss += loss_i.detach().cpu().item()
+
+            batch_surrogate_losses.append(current_batch_item_loss / G)
 
             del prefix
             del gold_window
@@ -842,10 +840,8 @@ for item in progress:
             del logp_cpu_view
             del lengths_cpu_view
             del rollout_advantages
-            del per_rollout_thought_logprobs_new
-            del per_rollout_thought_logprobs_old
 
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(compiled_model.parameters(), max_norm=1.0)
         optimizer.step()
 
         avg_loss += sum(batch_surrogate_losses) / len(batch_surrogate_losses) / PPO_EPOCHS

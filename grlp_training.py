@@ -329,21 +329,24 @@ def gather_token_logprobs_from_logits(logits, target_ids):
     return logprobs.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
 
 
-def compute_teacher_forced_logprobs(model, input_ids, gold_targets, *, temperature=1.0, keep_grad=True, inference_mode=False):
+def compute_teacher_forced_logprobs(model, input_ids, gold_targets, attention_mask=None, *, temperature=1.0, keep_grad=True, inference_mode=False):
     """
     Compute per-token log-probs under teacher forcing for the sequence:
       model(input_ids) where input_ids = prefix + optional cot + gold_seq
     We want the log-probabilities for gold_seq positions (the final len(gold_targets) tokens).
-    Returns: tensor shape (len(gold_targets),) of log-probs (float)
+    Returns: tensor shape (B, len(gold_targets)) of log-probs (float)
     """
+    if attention_mask is None:
+        attention_mask = torch.ones_like(input_ids)
+        
     with inference_context(model, with_grad=keep_grad, inference_mode=inference_mode):
         # model returns logits for each position predicting the *next* token
         outputs = model(
             input_ids=input_ids,
-            attention_mask=torch.ones_like(input_ids),
+            attention_mask=attention_mask,
             past_key_values=None,
             use_cache=False
-        ).logits  # (1, seq_len, vocab)
+        ).logits  # (B, seq_len, vocab)
     # the predicted distribution at position j corresponds to next token at j+1.
     # Suppose input_ids = [prefix_tokens, cot_tokens, gold0, gold1, ...,
     #                       gold_{H-1}]
@@ -357,12 +360,11 @@ def compute_teacher_forced_logprobs(model, input_ids, gold_targets, *, temperatu
     start_idx = prefix_len - 1
     end_idx = prefix_len + target_len - 1  # exclusive index in python slicing
     # select logits corresponding to predictions for gold tokens:
-    logits_for_gold = outputs[:, start_idx:end_idx, :]   # (1, H, V)
-    # targets for those positions are exactly gold_targets (shape (1, H))
+    logits_for_gold = outputs[:, start_idx:end_idx, :]   # (B, H, V)
+    # targets for those positions are exactly gold_targets (shape (B, H))
     per_token_logp = gather_token_logprobs_from_logits(logits_for_gold / temperature, gold_targets)
-    # shape (1, H) -> squeeze
-    result = per_token_logp.squeeze(0)  # (H,)
-    return result if keep_grad else result.detach()
+    # shape (B, H)
+    return per_token_logp if keep_grad else per_token_logp.detach()
 
 
 def make_prefix_and_gold_from_full_input(input_ids, t):
@@ -465,20 +467,25 @@ def rollout(model, prefix, num_rollouts=G, temperature=TEMPERATURE, max_new_toke
 
     # 3️⃣ Initialize rollout state
     past_key_values = cache_copy.batch_repeat_interleave(num_rollouts)
-    generated = prefix.repeat(num_rollouts, 1)
-    attention_mask = torch.ones_like(generated)
-    eos_reached = torch.zeros(num_rollouts, dtype=torch.bool, device=generated.device)
+    # We only need the last token of the prefix to start generation if using cache
+    current_input_ids = prefix[:, -1:].repeat(num_rollouts, 1)
+    
+    # Attention mask must cover the full sequence (prefix + generated so far)
+    attention_mask = torch.ones((num_rollouts, prefix.size(1)), dtype=torch.long, device=prefix.device)
+    
+    eos_reached = torch.zeros(num_rollouts, dtype=torch.bool, device=prefix.device)
 
-    rollouts_ct = torch.full((num_rollouts, 0), fill_value=0, dtype=torch.long, device=generated.device)
-    per_token_logp = torch.empty(num_rollouts, 0, dtype=torch.bfloat16, device=generated.device)
+    rollouts_ct = torch.zeros((num_rollouts, max_new_tokens), dtype=torch.long, device=prefix.device)
+    per_token_logp = torch.zeros((num_rollouts, max_new_tokens), dtype=torch.bfloat16, device=prefix.device)
 
     # Prealloc temp tensors to avoid reallocations
-    token_buffer = torch.empty(num_rollouts, 1, dtype=torch.long, device=generated.device)
+    token_buffer = torch.empty(num_rollouts, 1, dtype=torch.long, device=prefix.device)
 
     # 4️⃣ Step-by-step autoregressive sampling
+    step = 0
     for _ in range(max_new_tokens):
         out = model(
-            input_ids=generated[:, -1:],  # last token only
+            input_ids=current_input_ids,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
             use_cache=True
@@ -493,16 +500,19 @@ def rollout(model, prefix, num_rollouts=G, temperature=TEMPERATURE, max_new_toke
 
         # Record logprobs for chosen tokens
         chosen_logp = torch.log(probs).gather(-1, next_tokens)  # [G, 1]
-        per_token_logp = torch.cat((per_token_logp, chosen_logp), dim=1)
+        per_token_logp[:, step] = chosen_logp.squeeze(-1)
 
         # Append new tokens to rollout continuation
-        rollouts_ct = torch.cat((rollouts_ct, next_tokens), dim=1)
-        generated = torch.cat((generated, next_tokens), dim=1)
+        rollouts_ct[:, step] = next_tokens.squeeze(-1)
+        
+        # Update state for next step
+        current_input_ids = next_tokens
         attention_mask = torch.cat((attention_mask, torch.ones_like(next_tokens)), dim=1)
 
         # Handle early stopping <eos>
         eos_reached |= (next_tokens.squeeze(-1) == eos_token_id) 
         # eos_reached |= (next_tokens.squeeze(-1) == end_thought)
+        step += 1
         if eos_reached.all():
             break
 
@@ -510,8 +520,8 @@ def rollout(model, prefix, num_rollouts=G, temperature=TEMPERATURE, max_new_toke
     rollouts_ct_list = []
     per_token_logp_list = []
     for i in range(num_rollouts):
-        tokens = rollouts_ct[i, :]
-        logps = per_token_logp[i, :]
+        tokens = rollouts_ct[i, :step]
+        logps = per_token_logp[i, :step]
 
         eos_positions = (tokens == eos_token_id).nonzero(as_tuple=False)
         if eos_positions.numel() > 0:
@@ -690,7 +700,7 @@ for item in progress:
     num_candidate_positions = min(BATCH_SIZE, L - HORIZON - 1)
     candidate_positions = torch.randint(2, L - HORIZON - 1, (num_candidate_positions,)).tolist()
 
-    ema_token_logprobs_full = compute_teacher_forced_logprobs(ema_model, full_input_ids, full_input_ids[:, 1:], keep_grad=False, inference_mode=True)  # (L-1,)
+    ema_token_logprobs_full = compute_teacher_forced_logprobs(ema_model, full_input_ids, full_input_ids[:, 1:], keep_grad=False, inference_mode=True).squeeze(0)  # (L-1,)
     prefix_cache_map = collect_prefix_caches(model, full_input_ids, candidate_positions)
 
     batch_advantages = []
@@ -804,33 +814,69 @@ for item in progress:
             del rollout_advantages_cpu
 
             # - compute reasoned per-token logprobs s_pred^i for horizon H under current model conditioned on prefix + c_t + gold_window
-            current_batch_item_loss = 0.0
             
-            for i, length in enumerate(lengths_list):
-                if length == 0:
-                    continue
-                
-                ct_tokens = tokens_buffer[i, :length].unsqueeze(0)
-                # Build input: prefix + cot_tokens + gold_window
-                inp_thought = torch.cat([prefix, ct_tokens], dim=1)  # (1, P+C)
-                # compute per-token log-probs under current model for cot_tokens
+            num_rollouts_in_buffer = len(lengths_list)
+            if num_rollouts_in_buffer == 0:
+                continue
 
-                torch.compiler.cudagraph_mark_step_begin()
-                per_token_logp_new = compute_teacher_forced_logprobs(compiled_model, inp_thought, ct_tokens, temperature=TEMPERATURE)  # (C,)
-                
-                # Compute loss for this rollout immediately to avoid CUDA graph memory overwrite
-                logp_old = logp_buffer[i, :length]
-                advantage = rollout_advantages[i]
-                
-                loss_i = compute_surrogate_loss(per_token_logp_new, logp_old, advantage)
-                
-                # Backprop immediately (scaled by 1/G)
-                loss_to_backprop = loss_i / G
-                loss_to_backprop.backward()
-                
-                current_batch_item_loss += loss_i.detach().cpu().item()
-
-            batch_surrogate_losses.append(current_batch_item_loss / G)
+            # Batch processing
+            # tokens_buffer: (G, MaxSeqLen)
+            # prefix: (1, P)
+            
+            # Expand prefix
+            prefix_batch = prefix.expand(num_rollouts_in_buffer, -1)
+            
+            # Concatenate prefix + tokens
+            # input_ids: (G, P + MaxSeqLen)
+            input_ids = torch.cat([prefix_batch, tokens_buffer], dim=1)
+            
+            # Create attention mask
+            # 1 for prefix, 1 for valid tokens, 0 for padding
+            seq_len = tokens_buffer.size(1)
+            range_tensor = torch.arange(seq_len, device=DEVICE).unsqueeze(0) # (1, MaxSeqLen)
+            lengths_tensor = torch.tensor(lengths_list, device=DEVICE).unsqueeze(1) # (G, 1)
+            mask_cot = range_tensor < lengths_tensor # (G, MaxSeqLen)
+            
+            mask_prefix = torch.ones_like(prefix_batch, dtype=torch.bool)
+            attention_mask = torch.cat([mask_prefix, mask_cot], dim=1).long() # (G, P + MaxSeqLen)
+            
+            torch.compiler.cudagraph_mark_step_begin()
+            
+            # Compute logprobs for the CoT part
+            # gold_targets is tokens_buffer
+            # returns (G, MaxSeqLen)
+            per_token_logp_new = compute_teacher_forced_logprobs(
+                compiled_model, 
+                input_ids, 
+                tokens_buffer, 
+                attention_mask=attention_mask, 
+                temperature=TEMPERATURE
+            )
+            
+            # Compute loss
+            logp_old = logp_buffer # (G, MaxSeqLen)
+            advantage = rollout_advantages.unsqueeze(1) # (G, 1)
+            
+            log_rhos = per_token_logp_new - logp_old
+            rhos = torch.exp(log_rhos)
+            clip_rhos = torch.clamp(rhos, 1.0 - EPS_CLIP_LOW, 1.0 + EPS_CLIP_HIGH)
+            
+            surrogate = torch.min(rhos * advantage, clip_rhos * advantage)
+            
+            # Mask out padding
+            surrogate = surrogate * mask_cot
+            
+            # Mean per rollout
+            row_sums = surrogate.sum(dim=1)
+            row_counts = lengths_tensor.squeeze(1).float().clamp(min=1.0)
+            row_means = row_sums / row_counts
+            
+            # Average over batch (G)
+            loss = - row_means.mean()
+            
+            loss.backward()
+            
+            batch_surrogate_losses.append(loss.detach().cpu().item())
 
             del prefix
             del gold_window

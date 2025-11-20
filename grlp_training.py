@@ -23,6 +23,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from contextlib import contextmanager
+import bitsandbytes as bnb
 
 
 # -----------------------------
@@ -382,54 +383,76 @@ def make_prefix_and_gold_from_full_input(input_ids, t):
 
 @torch.no_grad()
 def compute_returns(rollouts_ct, rollout_caches, prefix, gold_window, model, s_ema_per_token):
-    """Compute discounted returns for each rollout individually."""
-
+    """Compute discounted returns for all rollouts in a batch."""
     device = prefix.device
-    s_ema = s_ema_per_token.to(device)
-    gold_len = gold_window.size(1)
-    steps = torch.arange(gold_len, device=device, dtype=s_ema.dtype)
-    discounts = torch.pow(torch.tensor(GAMMA, device=device, dtype=s_ema.dtype), steps)
+    G = len(rollouts_ct)
+    if G == 0:
+        return torch.empty(0, device=device, dtype=s_ema_per_token.dtype)
 
-    appended_tokens = torch.cat([end_thought_id.to(device), gold_window], dim=1)
-    gold_window = gold_window.to(device)
-
-    returns = []
+    # 1. Calculate lengths
+    # rollouts_ct are already trimmed to [start, ..., eos]
+    ct_lens = torch.tensor([ct.size(1) for ct in rollouts_ct], device=device, dtype=torch.long)
     prefix_len = prefix.size(1)
 
-    # prefix_str = tokenizer.decode(prefix.squeeze(0).tolist())
-    # gold_str = tokenizer.decode(gold_window.squeeze(0).tolist())
+    # 2. Prepare inputs
+    # appended_tokens: </think> + gold_window
+    appended_tokens = torch.cat([end_thought_id.to(device), gold_window.to(device)], dim=1) # (1, 1+H)
+    appended_len = appended_tokens.size(1)
+    input_ids = appended_tokens.repeat(G, 1) # (G, 1+H)
 
-    for i, ct in enumerate(rollouts_ct):
-        ct_len = ct.size(1)
-        eos_positions = (ct == tokenizer.eos_token_id).nonzero(as_tuple=False)
-        if eos_positions.numel() > 0:
-            ct_len = eos_positions[0, 1].item()
+    # 3. Prepare Attention Mask
+    if isinstance(rollout_caches, DynamicCache):
+        cache_len = rollout_caches.get_seq_length()
+    else:
+        cache_len = rollout_caches[0][0].size(2)
 
-        # log_sampled_thought(global_step, None, i, ct.unsqueeze(0), prefix_str, gold_str)
-        # log_sampled_thought(global_step, None, i, torch.cat([ct[:, :ct_len], end_thought_id], dim=1), prefix_str, gold_str)
+    total_len = cache_len + appended_len
+    attention_mask = torch.ones((G, total_len), dtype=torch.long, device=device)
+    
+    # Mask out garbage in cache (tokens generated after EOS for that rollout)
+    cache_indices = torch.arange(cache_len, device=device).unsqueeze(0) # (1, cache_len)
+    valid_cache_lens = (prefix_len + ct_lens).unsqueeze(1) # (G, 1)
+    cache_mask = (cache_indices < valid_cache_lens).long() # (G, cache_len)
+    attention_mask[:, :cache_len] = cache_mask
 
-        context_len = prefix_len + ct_len
-        cache_trimmed = select_cache_for_batch(rollout_caches, i, context_len)
+    # 4. Prepare Position IDs
+    # The appended tokens should start at position (prefix_len + ct_len)
+    offsets = (prefix_len + ct_lens).unsqueeze(1) # (G, 1)
+    pos_indices = torch.arange(appended_len, device=device).unsqueeze(0) # (1, appended_len)
+    position_ids = offsets + pos_indices # (G, appended_len)
 
-        attn_mask = torch.ones(1, context_len + appended_tokens.size(1), dtype=torch.long, device=device)
-
-        outputs = model(
-            input_ids=appended_tokens,
-            attention_mask=attn_mask,
-            past_key_values=cache_trimmed,
-            use_cache=True,
-        )
-
-        logits_gold = outputs.logits[:, :-1, :]
-        s_pred = gather_token_logprobs_from_logits(logits_gold, gold_window)
-        r_per_token = s_pred.squeeze(0) - s_ema
-        R = torch.sum(r_per_token * discounts)
-        returns.append(R)
-
-    if not returns:
-        return torch.empty(0, device=device, dtype=s_ema.dtype)
-
-    return torch.stack(returns)
+    # 5. Forward Pass
+    outputs = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        past_key_values=rollout_caches,
+        use_cache=True, 
+    )
+    
+    # 6. Compute Returns
+    # logits for predicting gold_window tokens
+    # input: [</think>, G0, G1, ... GH-1]
+    # logits index 0 predicts G0
+    # logits index H-1 predicts GH-1 (wait, GH-1 is the last token in gold_window)
+    # We want logprobs for G0...GH-1
+    # The tokens predicting them are at indices 0...H-1
+    
+    H = gold_window.size(1)
+    logits = outputs.logits[:, :H, :] # (G, H, V)
+    
+    gold_targets = gold_window.to(device).expand(G, -1)
+    s_pred = gather_token_logprobs_from_logits(logits, gold_targets) # (G, H)
+    
+    s_ema = s_ema_per_token.to(device).unsqueeze(0) # (1, H)
+    r_per_token = s_pred - s_ema # (G, H)
+    
+    steps = torch.arange(H, device=device, dtype=s_pred.dtype)
+    discounts = torch.pow(torch.tensor(GAMMA, device=device, dtype=s_pred.dtype), steps)
+    
+    R = torch.sum(r_per_token * discounts, dim=1) # (G,)
+    
+    return R
 
 def compute_surrogate_loss(logp_new, logp_old, advantage, mask_cot, lengths_tensor):
     # compute per-thought clipped surrogate loss (Eq.8)
@@ -673,7 +696,7 @@ else:
     compiled_model = model
 ema_model = torch.compile(ema_model, mode=compile_mode, dynamic=True)
 
-optimizer = torch.optim.AdamW(compiled_model.parameters(), lr=LR)
+optimizer = bnb.optim.AdamW8bit(compiled_model.parameters(), lr=LR)
 
 print_gpu_memory("Post-model-load")
 
@@ -917,11 +940,10 @@ for item in progress:
         optimizer.step()
 
         batch_surrogate_losses.append(loss.detach().cpu().item())
-        avg_loss += loss.detach().cpu().item() / PPO_EPOCHS
+        avg_loss += sum(batch_surrogate_losses) / len(batch_surrogate_losses) / PPO_EPOCHS
 
-        # Cleanup
-        del batched_input_ids, batched_labels, batched_logp_old, batched_advantages, batched_attention_mask
-        del logits, shift_labels, shift_logp_old, log_probs_temp, per_token_logp_new
+    # Clear gradients to free memory
+    optimizer.zero_grad(set_to_none=True)
 
     metric_history["loss"].append(avg_loss)
     postfix = {

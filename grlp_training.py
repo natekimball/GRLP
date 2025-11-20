@@ -361,6 +361,11 @@ def compute_teacher_forced_logprobs(model, input_ids, gold_targets, attention_ma
     end_idx = prefix_len + target_len - 1  # exclusive index in python slicing
     # select logits corresponding to predictions for gold tokens:
     logits_for_gold = outputs[:, start_idx:end_idx, :]   # (B, H, V)
+    
+    # Clone to avoid CUDAGraph memory overwrite issues during backward pass
+    if keep_grad:
+        logits_for_gold = logits_for_gold.clone()
+
     # targets for those positions are exactly gold_targets (shape (B, H))
     per_token_logp = gather_token_logprobs_from_logits(logits_for_gold / temperature, gold_targets)
     # shape (B, H)
@@ -423,19 +428,28 @@ def compute_returns(rollouts_ct, rollout_caches, prefix, gold_window, model, s_e
 
     return torch.stack(returns)
 
-def compute_surrogate_loss(logp_new, logp_old, advantage):
+def compute_surrogate_loss(logp_new, logp_old, advantage, mask_cot, lengths_tensor):
     # compute per-thought clipped surrogate loss (Eq.8)
     # importance ratios per token
-    log_rhos = logp_new - logp_old.to(logp_new.device)  # (C,)
-    rhos = torch.exp(log_rhos)                           # (C,)
+    log_rhos = logp_new - logp_old.to(logp_new.device)  # (B, C)
+    rhos = torch.exp(log_rhos)
     # clip
     clip_rhos = torch.clamp(rhos, 1.0 - EPS_CLIP_LOW, 1.0 + EPS_CLIP_HIGH)
+    
     # surrogate per token: min(rho * sg(A), clip(rho) * sg(A))
     # negative sign because we maximize reward -> minimize negative surrogate
-    # Also divide by |c| as in Eq.8
-    surrogate_per_token = torch.min(rhos * advantage, clip_rhos * advantage)
-    return - surrogate_per_token.mean()  # scalar
-
+    surrogate = torch.min(rhos * advantage, clip_rhos * advantage)
+    
+    # mask out padding
+    surrogate = surrogate * mask_cot
+    
+    # also divide by |c| as in Eq.8
+    row_sums = surrogate.sum(dim=1)
+    row_counts = lengths_tensor.squeeze(1).float().clamp(min=1.0)
+    row_means = row_sums / row_counts
+    
+    # average over batch (G)
+    return - row_means.mean()
 
 @torch.no_grad()
 def rollout(model, prefix, num_rollouts=G, temperature=TEMPERATURE, max_new_tokens=THOUGHT_MAX_TOKENS, prefix_cache=None):
@@ -648,8 +662,7 @@ ema_model = copy.deepcopy(model).to(DEVICE)
 for p in ema_model.parameters():
     p.requires_grad_(False)
 
-# compile_mode = None # set to "max-autotune" for performance
-compile_mode = "max-autotune-no-cudagraphs"
+compile_mode = "default" # set to "max-autotune-no-cudagraphs" for performance
 if COMPILE_MODEL:
     print("Compiling model...")
     compiled_model = torch.compile(model, mode=compile_mode, dynamic=True)
@@ -806,15 +819,13 @@ for item in progress:
             gold_window = gold_window_cpu.to(DEVICE, non_blocking=True)
             tokens_cpu_view, logp_cpu_view, lengths_cpu_view = rollout_buffer.views()
             tokens_buffer = tokens_cpu_view.to(DEVICE, non_blocking=True)
-            logp_buffer = logp_cpu_view.to(DEVICE, non_blocking=True)
+            logp_buffer = logp_cpu_view.to(DEVICE, non_blocking=True) # (G, MaxSeqLen)
             lengths_list = lengths_cpu_view.tolist()
-            rollout_advantages = rollout_advantages_cpu.to(DEVICE, non_blocking=True)
+            rollout_advantages = rollout_advantages_cpu.to(DEVICE, non_blocking=True).unsqueeze(1)  # (G, 1)
             del prefix_cpu
             del gold_window_cpu
             del rollout_advantages_cpu
 
-            # - compute reasoned per-token logprobs s_pred^i for horizon H under current model conditioned on prefix + c_t + gold_window
-            
             num_rollouts_in_buffer = len(lengths_list)
             if num_rollouts_in_buffer == 0:
                 continue
@@ -840,8 +851,6 @@ for item in progress:
             mask_prefix = torch.ones_like(prefix_batch, dtype=torch.bool)
             attention_mask = torch.cat([mask_prefix, mask_cot], dim=1).long() # (G, P + MaxSeqLen)
             
-            torch.compiler.cudagraph_mark_step_begin()
-            
             # Compute logprobs for the CoT part
             # gold_targets is tokens_buffer
             # returns (G, MaxSeqLen)
@@ -853,26 +862,7 @@ for item in progress:
                 temperature=TEMPERATURE
             )
             
-            # Compute loss
-            logp_old = logp_buffer # (G, MaxSeqLen)
-            advantage = rollout_advantages.unsqueeze(1) # (G, 1)
-            
-            log_rhos = per_token_logp_new - logp_old
-            rhos = torch.exp(log_rhos)
-            clip_rhos = torch.clamp(rhos, 1.0 - EPS_CLIP_LOW, 1.0 + EPS_CLIP_HIGH)
-            
-            surrogate = torch.min(rhos * advantage, clip_rhos * advantage)
-            
-            # Mask out padding
-            surrogate = surrogate * mask_cot
-            
-            # Mean per rollout
-            row_sums = surrogate.sum(dim=1)
-            row_counts = lengths_tensor.squeeze(1).float().clamp(min=1.0)
-            row_means = row_sums / row_counts
-            
-            # Average over batch (G)
-            loss = - row_means.mean()
+            loss = compute_surrogate_loss(logp_new=per_token_logp_new, logp_old=logp_buffer, advantage=rollout_advantages, mask_cot=mask_cot, lengths_tensor=lengths_tensor)
             
             loss.backward()
             

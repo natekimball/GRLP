@@ -136,7 +136,11 @@ def load_model_and_tokenizer():
     assert len(ids_eos) == 1 and ids_eos[0] == THINK_EOS_ID, "THINK_EOS_TOKEN not atomic"
 
     dtype = torch.bfloat16 if DTYPE == "bfloat16" else torch.float16
-    model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=dtype)
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME, 
+        torch_dtype=dtype,
+        attn_implementation="flash_attention_2"
+    )
     model.to(DEVICE)
     model.train()
     return model, tok

@@ -397,77 +397,26 @@ def _sample_thought_ids_for_prefix(
 def _thought_token_logprobs(
     model, tokenizer, prefix_ids: List[int], thought_ids: List[int], require_grad: bool
 ) -> torch.Tensor:
-    assert THINK_BOS_ID is not None and THINK_EOS_ID is not None
+    assert THINK_BOS_ID is not None
     device = next(model.parameters()).device
 
-    def forward_once(x_ids: List[int]) -> torch.Tensor:
-        x = torch.tensor([x_ids], dtype=torch.long, device=device)
-        out = model(input_ids=x)
-        return out.logits[0, -1, :]
+    x_ids = prefix_ids + [THINK_BOS_ID] + thought_ids
+    x = torch.tensor([x_ids], dtype=torch.long, device=device)
 
-    eos_id = tokenizer.eos_token_id
-    if isinstance(eos_id, (list, tuple)):
-        eos_id = eos_id[0] if len(eos_id) > 0 else None
-    pad_id = tokenizer.pad_token_id
-    if isinstance(pad_id, (list, tuple)):
-        pad_id = pad_id[0] if len(pad_id) > 0 else None
-
-    eval_mode = "temp_only" if PPO_POLICY_EVAL == "temp_only" else "strict"
-    top_p_eval = 1.0 if PPO_POLICY_EVAL == "temp_only" else TOP_P
-
-    ctx_ids = list(prefix_ids) + [THINK_BOS_ID]
-    logps: List[torch.Tensor] = []
-
-    was_training = model.training
-    if was_training:
-        model.eval()
-
-    prev_grad_state = torch.is_grad_enabled()
+    prev_grad = torch.is_grad_enabled()
     torch.set_grad_enabled(require_grad)
     try:
-        for tok in thought_ids:
-            logits_step = forward_once(ctx_ids)
-            probs_norm, _ = _policy_distribution_from_logits(
-                logits_step, TEMPERATURE, top_p_eval, eval_mode=eval_mode
-            )
+        out = model(input_ids=x)
+        logits = out.logits[0]
 
+        start = len(prefix_ids)
+        logits_thought = logits[start : start + len(thought_ids), :]
+        targets = torch.tensor(thought_ids, device=device)
 
-            changed = False
-            if eos_id is not None and eos_id != THINK_EOS_ID and eos_id < probs_norm.numel():
-                probs_norm = probs_norm.clone(); probs_norm[eos_id] = 0.0; changed = True
-            if pad_id is not None and pad_id != THINK_EOS_ID and pad_id < probs_norm.numel():
-                probs_norm = probs_norm.clone(); probs_norm[pad_id] = 0.0; changed = True
-
-            step_idx = len(ctx_ids) - (len(prefix_ids) + 1)  # tokens already generated in thought
-            if step_idx < max(MIN_NEW_TOKENS - 1, 0) and THINK_EOS_ID < probs_norm.numel():
-                probs_norm = probs_norm.clone(); probs_norm[THINK_EOS_ID] = 0.0; changed = True
-
-            if THINK_BOS_ID < probs_norm.numel():
-                probs_norm = probs_norm.clone(); probs_norm[THINK_BOS_ID] = 0.0; changed = True
-
-            if changed:
-                s = probs_norm.sum()
-                if not torch.isfinite(s) or s.item() <= 0:
-                    probs_norm = F.softmax(logits_step.float() / max(1e-6, TEMPERATURE), dim=-1)
-                    if eos_id is not None and eos_id != THINK_EOS_ID and eos_id < probs_norm.numel():
-                        probs_norm[eos_id] = 0.0
-                    if pad_id is not None and pad_id != THINK_EOS_ID and pad_id < probs_norm.numel():
-                        probs_norm[pad_id] = 0.0
-                    if step_idx < max(MIN_NEW_TOKENS - 1, 0) and THINK_EOS_ID < probs_norm.numel():
-                        probs_norm[THINK_EOS_ID] = 0.0
-                    if THINK_BOS_ID < probs_norm.numel():
-                        probs_norm[THINK_BOS_ID] = 0.0
-                probs_norm = probs_norm / (probs_norm.sum() + 1e-12)
-
-            p_tok = probs_norm[tok] if tok < probs_norm.numel() else torch.tensor(0.0, device=device)
-            logps.append(torch.log(p_tok.clamp_min(EPS_MIN_PROB)))
-            ctx_ids.append(tok)
+        logp = F.log_softmax(logits_thought.float(), dim=-1)
+        return logp.gather(-1, targets.unsqueeze(-1)).squeeze(-1).to(torch.float32)
     finally:
-        torch.set_grad_enabled(prev_grad_state)
-        if was_training:
-            model.train()
-
-    return torch.stack(logps).to(torch.float32)
+        torch.set_grad_enabled(prev_grad)
 
 def init_think_tokens(model, tok, ref_token="."):
     emb = model.get_input_embeddings().weight

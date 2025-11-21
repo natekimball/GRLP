@@ -229,8 +229,10 @@ def iter_fineweb_first_n(
         )
         ids = enc["input_ids"]
         mask = enc["attention_mask"]
-        if tokenizer.eos_token_id is not None and len(ids) == max_len:
+        valid_length = int(sum(mask))
+        if tokenizer.eos_token_id is not None and valid_length == max_len:
             ids[-1] = tokenizer.eos_token_id
+            mask[-1] = 1
         return {"input_ids": ids, "attention_mask": mask}
  
     tokenized = ds.map(encode)

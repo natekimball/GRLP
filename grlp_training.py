@@ -15,7 +15,6 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.cache_utils import DynamicCache
-from torch.nn.utils.rnn import pad_sequence
 from datasets import load_dataset, Dataset
 from tqdm import tqdm
 import argparse
@@ -23,7 +22,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from contextlib import contextmanager
-import bitsandbytes as bnb
 
 
 # -----------------------------
@@ -33,6 +31,7 @@ import bitsandbytes as bnb
 parser = argparse.ArgumentParser(description="Generalized RLP prototype training")
 parser.add_argument("--model-name", type=str, default="Qwen/Qwen3-1.7B-Base", help="Model name or path to saved model")
 parser.add_argument("--plot-path", type=str, default="grlp-plots.png", help="Path to save metric plots")
+parser.add_argument("--mini-batch-size", type=int, default=1, help="PPO mini-batch size (number of contexts per update step)")
 args = parser.parse_args()
 
 MODEL_NAME = args.model_name
@@ -47,6 +46,7 @@ DATA_CACHE_DIR = Path("data/fineweb-10k-tokenized")
 # G = 2                                   # number of rollouts per context
 # GAMMA = 0.7                             # discount factor
 # BATCH_SIZE = 2                          # token-level RLP is expensive; tune for your memory
+# MINI_BATCH_SIZE = args.mini_batch_size
 # LR = 1e-6
 # TAU = 0.999                             # EMA decay
 # EPS_CLIP_LOW, EPS_CLIP_HIGH = 0.1, 0.1  # PPO clipping
@@ -63,6 +63,7 @@ THOUGHT_MAX_TOKENS = 2048
 G = 16                                  # number of rollouts per context
 GAMMA = 0.7                             # discount factor
 BATCH_SIZE = 16                         # token-level RLP is expensive; tune for your memory
+MINI_BATCH_SIZE = args.mini_batch_size
 LR = 1e-6
 TAU = 0.999                             # EMA decay
 EPS_CLIP_LOW, EPS_CLIP_HIGH = 0.1, 0.1  # PPO clipping
@@ -83,7 +84,6 @@ torch.set_float32_matmul_precision('high')
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True  # noqa
 torch._dynamo.config.allow_unspec_int_on_nn_module = True
-torch._dynamo.config.capture_scalar_outputs = True
 
 _BACKGROUND_EXECUTOR = ThreadPoolExecutor(max_workers=1)
 _BACKGROUND_FUTURES: List[Future] = []
@@ -326,10 +326,13 @@ def gather_token_logprobs_from_logits(logits, target_ids):
     target_ids: (B, S) tokens that the logits are predicting (i.e. next-token targets)
     returns: per-token log probability shape (B, S)
     """
-    logprobs = F.log_softmax(logits, dim=-1)
-    # gather the logprob of each target token
-    # target_ids must be long dtype
-    return logprobs.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
+    # Use cross_entropy for memory efficiency (avoids materializing full log_softmax)
+    # F.cross_entropy returns negative log likelihood, so we negate it.
+    return -F.cross_entropy(
+        logits.view(-1, logits.size(-1)), 
+        target_ids.view(-1), 
+        reduction='none'
+    ).view(target_ids.size())
 
 
 def compute_teacher_forced_logprobs(model, input_ids, gold_targets, attention_mask=None, *, temperature=1.0, keep_grad=True, inference_mode=False):
@@ -365,10 +368,11 @@ def compute_teacher_forced_logprobs(model, input_ids, gold_targets, attention_ma
     # select logits corresponding to predictions for gold tokens:
     logits_for_gold = outputs[:, start_idx:end_idx, :]   # (B, H, V)
     
-    # For max-autotune
-    # # Clone to avoid CUDAGraph memory overwrite issues during backward pass
-    # if keep_grad:
-    #     logits_for_gold = logits_for_gold.clone()
+    # Memory optimization: Clone the slice we need and drop the full outputs tensor
+    # This allows the large (B, seq_len, V) tensor to be freed if not needed for backward of the slice source
+    if keep_grad:
+        logits_for_gold = logits_for_gold.clone()
+        del outputs
 
     # targets for those positions are exactly gold_targets (shape (B, H))
     per_token_logp = gather_token_logprobs_from_logits(logits_for_gold / temperature, gold_targets)
@@ -382,77 +386,55 @@ def make_prefix_and_gold_from_full_input(input_ids, t):
     return prefix, gold
 
 @torch.no_grad()
-def compute_returns(rollouts_ct, rollout_caches, prefix, gold_window, model, s_ema_per_token):
-    """Compute discounted returns for all rollouts in a batch."""
+def compute_returns(context_lens, rollout_caches, prefix, gold_window, model, s_ema_per_token):
+    """Compute discounted returns for each rollout individually."""
+
     device = prefix.device
-    G = len(rollouts_ct)
-    if G == 0:
-        return torch.empty(0, device=device, dtype=s_ema_per_token.dtype)
+    s_ema = s_ema_per_token.to(device)
+    gold_len = gold_window.size(1)
+    steps = torch.arange(gold_len, device=device, dtype=s_ema.dtype)
+    discounts = torch.pow(torch.tensor(GAMMA, device=device, dtype=s_ema.dtype), steps)
 
-    # 1. Calculate lengths
-    # rollouts_ct are already trimmed to [start, ..., eos]
-    ct_lens = torch.tensor([ct.size(1) for ct in rollouts_ct], device=device, dtype=torch.long)
-    prefix_len = prefix.size(1)
+    appended_tokens = torch.cat([end_thought_id.to(device), gold_window], dim=1)
+    gold_window = gold_window.to(device)
 
-    # 2. Prepare inputs
-    # appended_tokens: </think> + gold_window
-    appended_tokens = torch.cat([end_thought_id.to(device), gold_window.to(device)], dim=1) # (1, 1+H)
-    appended_len = appended_tokens.size(1)
-    input_ids = appended_tokens.repeat(G, 1) # (G, 1+H)
+    returns = []
+    # prefix_len = prefix.size(1)
 
-    # 3. Prepare Attention Mask
-    if isinstance(rollout_caches, DynamicCache):
-        cache_len = rollout_caches.get_seq_length()
-    else:
-        cache_len = rollout_caches[0][0].size(2)
+    # prefix_str = tokenizer.decode(prefix.squeeze(0).tolist())
+    # gold_str = tokenizer.decode(gold_window.squeeze(0).tolist())
 
-    total_len = cache_len + appended_len
-    attention_mask = torch.ones((G, total_len), dtype=torch.long, device=device)
-    
-    # Mask out garbage in cache (tokens generated after EOS for that rollout)
-    cache_indices = torch.arange(cache_len, device=device).unsqueeze(0) # (1, cache_len)
-    valid_cache_lens = (prefix_len + ct_lens).unsqueeze(1) # (G, 1)
-    cache_mask = (cache_indices < valid_cache_lens).long() # (G, cache_len)
-    attention_mask[:, :cache_len] = cache_mask
+    # for i, ct in enumerate(rollouts_ct):
+    #     ct_len = ct.size(1)
+    #     eos_positions = (ct == tokenizer.eos_token_id).nonzero(as_tuple=False)
+    #     if eos_positions.numel() > 0:
+    #         ct_len = eos_positions[0, 1].item()
+    for context_len in context_lens:
 
-    # 4. Prepare Position IDs
-    # The appended tokens should start at position (prefix_len + ct_len)
-    offsets = (prefix_len + ct_lens).unsqueeze(1) # (G, 1)
-    pos_indices = torch.arange(appended_len, device=device).unsqueeze(0) # (1, appended_len)
-    position_ids = offsets + pos_indices # (G, appended_len)
+        # log_sampled_thought(global_step, None, i, ct.unsqueeze(0), prefix_str, gold_str)
+        # log_sampled_thought(global_step, None, i, torch.cat([ct[:, :ct_len], end_thought_id], dim=1), prefix_str, gold_str)
 
-    # 5. Forward Pass
-    outputs = model(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        position_ids=position_ids,
-        past_key_values=rollout_caches,
-        use_cache=True, 
-    )
-    
-    # 6. Compute Returns
-    # logits for predicting gold_window tokens
-    # input: [</think>, G0, G1, ... GH-1]
-    # logits index 0 predicts G0
-    # logits index H-1 predicts GH-1 (wait, GH-1 is the last token in gold_window)
-    # We want logprobs for G0...GH-1
-    # The tokens predicting them are at indices 0...H-1
-    
-    H = gold_window.size(1)
-    logits = outputs.logits[:, :H, :] # (G, H, V)
-    
-    gold_targets = gold_window.to(device).expand(G, -1)
-    s_pred = gather_token_logprobs_from_logits(logits, gold_targets) # (G, H)
-    
-    s_ema = s_ema_per_token.to(device).unsqueeze(0) # (1, H)
-    r_per_token = s_pred - s_ema # (G, H)
-    
-    steps = torch.arange(H, device=device, dtype=s_pred.dtype)
-    discounts = torch.pow(torch.tensor(GAMMA, device=device, dtype=s_pred.dtype), steps)
-    
-    R = torch.sum(r_per_token * discounts, dim=1) # (G,)
-    
-    return R
+        cache_trimmed = select_cache_for_batch(rollout_caches, i, context_len)
+
+        attn_mask = torch.ones(1, context_len + appended_tokens.size(1), dtype=torch.long, device=device)
+
+        outputs = model(
+            input_ids=appended_tokens,
+            attention_mask=attn_mask,
+            past_key_values=cache_trimmed,
+            use_cache=True,
+        )
+
+        logits_gold = outputs.logits[:, :-1, :]
+        s_pred = gather_token_logprobs_from_logits(logits_gold, gold_window)
+        r_per_token = s_pred.squeeze(0) - s_ema
+        R = torch.sum(r_per_token * discounts)
+        returns.append(R)
+
+    if not returns:
+        return torch.empty(0, device=device, dtype=s_ema.dtype)
+
+    return torch.stack(returns)
 
 def compute_surrogate_loss(logp_new, logp_old, advantage, mask_cot, lengths_tensor):
     # compute per-thought clipped surrogate loss (Eq.8)
@@ -555,6 +537,7 @@ def rollout(model, prefix, num_rollouts=G, temperature=TEMPERATURE, max_new_toke
         step += 1
         if eos_reached.all():
             break
+    
 
     # 5️⃣ Post-process: split per-rollout
     rollouts_ct_list = []
@@ -696,7 +679,7 @@ else:
     compiled_model = model
 ema_model = torch.compile(ema_model, mode=compile_mode, dynamic=True)
 
-optimizer = bnb.optim.AdamW8bit(compiled_model.parameters(), lr=LR)
+optimizer = torch.optim.AdamW(compiled_model.parameters(), lr=LR)
 
 print_gpu_memory("Post-model-load")
 
@@ -771,7 +754,7 @@ for item in progress:
         )
 
         # Now for each rollout evaluate the reasoned per-token log-probs under the current model (p_theta)
-        returns = compute_returns(rollouts_ct, rollout_caches, reasoning_prefix, gold_window, model, s_ema_per_token)
+        returns = compute_returns(context_lens, rollout_caches, reasoning_prefix, gold_window, model, s_ema_per_token)
 
         # Drop rollout caches to avoid holding GPU references beyond this point
         del rollout_caches
@@ -833,117 +816,134 @@ for item in progress:
 
     avg_loss = 0.0
     # For each selected position t, compute G rollouts and returns; then accumulate surrogate losses
+    num_contexts = len(batch_prefixes)
+    indices = list(range(num_contexts))
+    
     for epoch in range(PPO_EPOCHS):
         batch_surrogate_losses = []
         optimizer.zero_grad(set_to_none=True)
 
-        # Collect all samples for batching
-        all_input_ids = []
-        all_labels = []
-        all_logp_old = []
-        all_advantages = []
-
-        for prefix_cpu, gold_window_cpu, rollout_buffer, rollout_advantages_cpu in zip(
-            batch_prefixes, batch_targets, batch_rollout_buffers, batch_advantages
-        ):
-            prefix = prefix_cpu.to(DEVICE, non_blocking=True)
+        for i in range(0, num_contexts, MINI_BATCH_SIZE):
+            chunk_indices = indices[i : i + MINI_BATCH_SIZE]
             
-            tokens_cpu_view, logp_cpu_view, lengths_cpu_view = rollout_buffer.views()
-            tokens_buffer = tokens_cpu_view.to(DEVICE, non_blocking=True) # (G, MaxSeqLen)
-            logp_buffer = logp_cpu_view.to(DEVICE, non_blocking=True) # (G, MaxSeqLen)
-            lengths_list = lengths_cpu_view.tolist()
-            rollout_advantages = rollout_advantages_cpu.to(DEVICE, non_blocking=True) # (G,)
-
-            num_rollouts_in_buffer = len(lengths_list)
-            if num_rollouts_in_buffer == 0:
+            chunk_prefixes = [batch_prefixes[j] for j in chunk_indices]
+            chunk_targets = [batch_targets[j] for j in chunk_indices]
+            chunk_buffers = [batch_rollout_buffers[j] for j in chunk_indices]
+            chunk_advantages = [batch_advantages[j] for j in chunk_indices]
+            
+            chunk_data = []
+            max_prefix_len = 0
+            max_cot_len = 0
+            
+            for prefix_cpu, gold_window_cpu, buffer, adv_cpu in zip(chunk_prefixes, chunk_targets, chunk_buffers, chunk_advantages):
+                tokens_cpu, logps_cpu, lengths_cpu = buffer.views()
+                if tokens_cpu.size(0) == 0:
+                    continue
+                
+                P = prefix_cpu.size(1)
+                max_prefix_len = max(max_prefix_len, P)
+                L = tokens_cpu.size(1)
+                max_cot_len = max(max_cot_len, L)
+                
+                chunk_data.append({
+                    'prefix': prefix_cpu,
+                    'tokens': tokens_cpu,
+                    'logps': logps_cpu,
+                    'lengths': lengths_cpu,
+                    'adv': adv_cpu
+                })
+            
+            if not chunk_data:
                 continue
-
-            # Prepare batch elements
-            for i in range(num_rollouts_in_buffer):
-                length = lengths_list[i]
-                if length == 0: continue
                 
-                curr_prefix = prefix.squeeze(0) # (P,)
-                curr_cot = tokens_buffer[i, :length] # (C,)
-                curr_logp = logp_buffer[i, :length] # (C,)
-                curr_adv = rollout_advantages[i] # scalar
-
-                # Input: Prefix + CoT
-                input_ids = torch.cat([curr_prefix, curr_cot], dim=0)
+            batched_input_ids = []
+            batched_targets = []
+            batched_attention_mask = []
+            batched_old_logps = []
+            batched_advantages = []
+            batched_mask_cot = []
+            batched_lengths = []
+            
+            for item in chunk_data:
+                prefix = item['prefix']
+                tokens = item['tokens']
+                logps = item['logps']
+                lengths = item['lengths']
+                adv = item['adv']
                 
-                # Labels: -100 for Prefix, CoT for CoT
-                prefix_labels = torch.full_like(curr_prefix, -100)
-                labels = torch.cat([prefix_labels, curr_cot], dim=0)
+                G_curr = tokens.size(0)
+                P = prefix.size(1)
+                L = tokens.size(1)
                 
-                # Logp Old: Pad prefix with 0 (dummy), CoT with logp
-                prefix_logp = torch.zeros_like(curr_prefix, dtype=curr_logp.dtype)
-                logp_old = torch.cat([prefix_logp, curr_logp], dim=0)
+                # Left-pad prefix
+                pad_p = max_prefix_len - P
+                prefix_expanded = prefix.repeat(G_curr, 1)
+                if pad_p > 0:
+                    prefix_padded = F.pad(prefix_expanded, (pad_p, 0), value=tokenizer.pad_token_id)
+                    prefix_mask = torch.cat([
+                        torch.zeros((G_curr, pad_p), dtype=torch.bool),
+                        torch.ones((G_curr, P), dtype=torch.bool)
+                    ], dim=1)
+                else:
+                    prefix_padded = prefix_expanded
+                    prefix_mask = torch.ones((G_curr, P), dtype=torch.bool)
+                
+                # Right-pad tokens (CoT)
+                pad_l = max_cot_len - L
+                if pad_l > 0:
+                    tokens_padded = F.pad(tokens, (0, pad_l), value=tokenizer.pad_token_id)
+                    logps_padded = F.pad(logps, (0, pad_l), value=0.0)
+                else:
+                    tokens_padded = tokens
+                    logps_padded = logps
+                
+                cot_range = torch.arange(max_cot_len).unsqueeze(0)
+                cot_mask = cot_range < lengths.unsqueeze(1)
+                
+                input_ids = torch.cat([prefix_padded, tokens_padded], dim=1)
+                att_mask = torch.cat([prefix_mask, cot_mask], dim=1)
+                
+                batched_input_ids.append(input_ids)
+                batched_targets.append(tokens_padded)
+                batched_attention_mask.append(att_mask)
+                batched_old_logps.append(logps_padded)
+                batched_advantages.append(adv)
+                batched_mask_cot.append(cot_mask)
+                batched_lengths.append(lengths)
 
-                all_input_ids.append(input_ids)
-                all_labels.append(labels)
-                all_logp_old.append(logp_old)
-                all_advantages.append(curr_adv)
+            input_ids_tensor = torch.cat(batched_input_ids, dim=0).to(DEVICE, non_blocking=True)
+            targets_tensor = torch.cat(batched_targets, dim=0).to(DEVICE, non_blocking=True)
+            attention_mask_tensor = torch.cat(batched_attention_mask, dim=0).to(DEVICE, non_blocking=True).long()
+            old_logps_tensor = torch.cat(batched_old_logps, dim=0).to(DEVICE, non_blocking=True)
+            advantages_tensor = torch.cat(batched_advantages, dim=0).to(DEVICE, non_blocking=True).unsqueeze(1)
+            mask_cot_tensor = torch.cat(batched_mask_cot, dim=0).to(DEVICE, non_blocking=True)
+            lengths_tensor = torch.cat(batched_lengths, dim=0).to(DEVICE, non_blocking=True).unsqueeze(1)
+            
+            per_token_logp_new = compute_teacher_forced_logprobs(
+                compiled_model, 
+                input_ids_tensor, 
+                targets_tensor, 
+                attention_mask=attention_mask_tensor, 
+                temperature=TEMPERATURE
+            )
+            
+            loss = compute_surrogate_loss(
+                logp_new=per_token_logp_new, 
+                logp_old=old_logps_tensor, 
+                advantage=advantages_tensor, 
+                mask_cot=mask_cot_tensor, 
+                lengths_tensor=lengths_tensor
+            )
+            
+            loss.backward()
+            batch_surrogate_losses.append(loss.detach().cpu().item())
+            
+            del input_ids_tensor, targets_tensor, attention_mask_tensor, old_logps_tensor, advantages_tensor, mask_cot_tensor, lengths_tensor
 
-        if not all_input_ids:
-            continue
-
-        # Pad and batch
-        pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
-        
-        batched_input_ids = pad_sequence(all_input_ids, batch_first=True, padding_value=pad_id)
-        batched_labels = pad_sequence(all_labels, batch_first=True, padding_value=-100)
-        batched_logp_old = pad_sequence(all_logp_old, batch_first=True, padding_value=0.0)
-        batched_advantages = torch.stack(all_advantages) # (Total_G,)
-
-        batched_attention_mask = (batched_input_ids != pad_id).long()
-        
-        # Forward pass
-        outputs = compiled_model(
-            input_ids=batched_input_ids,
-            attention_mask=batched_attention_mask,
-            use_cache=False
-        )
-        
-        logits = outputs.logits[:, :-1, :] # (B, S-1, V)
-        shift_labels = batched_labels[:, 1:] # (B, S-1)
-        shift_logp_old = batched_logp_old[:, 1:] # (B, S-1)
-        
-        # Compute logprobs with temperature
-        log_probs_temp = F.log_softmax(logits / TEMPERATURE, dim=-1)
-        
-        # Gather logprobs of the target tokens
-        gather_indices = shift_labels.clone()
-        gather_indices[gather_indices == -100] = 0
-        per_token_logp_new = log_probs_temp.gather(-1, gather_indices.unsqueeze(-1)).squeeze(-1)
-        
-        # Mask
-        mask = (shift_labels != -100)
-        
-        # Compute surrogate
-        advantage_expanded = batched_advantages.unsqueeze(1).expand_as(per_token_logp_new)
-        
-        log_rhos = per_token_logp_new - shift_logp_old
-        rhos = torch.exp(log_rhos)
-        clip_rhos = torch.clamp(rhos, 1.0 - EPS_CLIP_LOW, 1.0 + EPS_CLIP_HIGH)
-        surrogate = torch.min(rhos * advantage_expanded, clip_rhos * advantage_expanded)
-        
-        surrogate = surrogate * mask
-        
-        row_sums = surrogate.sum(dim=1)
-        row_counts = mask.sum(dim=1).float().clamp(min=1.0)
-        row_means = row_sums / row_counts
-        
-        loss = - row_means.mean()
-        
-        loss.backward()
         torch.nn.utils.clip_grad_norm_(compiled_model.parameters(), max_norm=1.0)
         optimizer.step()
 
-        batch_surrogate_losses.append(loss.detach().cpu().item())
         avg_loss += sum(batch_surrogate_losses) / len(batch_surrogate_losses) / PPO_EPOCHS
-
-    # Clear gradients to free memory
-    optimizer.zero_grad(set_to_none=True)
 
     metric_history["loss"].append(avg_loss)
     postfix = {

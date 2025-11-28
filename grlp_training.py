@@ -41,39 +41,39 @@ SPLIT = "train"
 N_DATA = 10_000
 DATA_CACHE_DIR = Path("data/fineweb-10k-tokenized")
 
-MAX_SEQ_LEN = 256
-HORIZON = 8                             # reward horizon T (small for debug; paper uses long)
-THOUGHT_MAX_TOKENS = 256
-G = 2                                   # number of rollouts per context
-GAMMA = 0.7                             # discount factor
-BATCH_SIZE = 2                          # token-level RLP is expensive; tune for your memory
-MINI_BATCH_SIZE = args.mini_batch_size
-LR = 1e-6
-TAU = 0.999                             # EMA decay
-EPS_CLIP_LOW, EPS_CLIP_HIGH = 0.1, 0.1  # PPO clipping
-PPO_EPOCHS = 2                          # number of policy optimization iterations per batch
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-DTYPE = torch.bfloat16
-COMPILE_MODEL = True
-USE_FLASH_ATTN = True
-TEMPERATURE = 0.7
-
-# MAX_SEQ_LEN = 2048
+# MAX_SEQ_LEN = 256
 # HORIZON = 8                             # reward horizon T (small for debug; paper uses long)
-# THOUGHT_MAX_TOKENS = 2048
-# G = 16                                  # number of rollouts per context
+# THOUGHT_MAX_TOKENS = 256
+# G = 2                                   # number of rollouts per context
 # GAMMA = 0.7                             # discount factor
-# BATCH_SIZE = 16                         # token-level RLP is expensive; tune for your memory
+# BATCH_SIZE = 2                          # token-level RLP is expensive; tune for your memory
 # MINI_BATCH_SIZE = args.mini_batch_size
 # LR = 1e-6
 # TAU = 0.999                             # EMA decay
 # EPS_CLIP_LOW, EPS_CLIP_HIGH = 0.1, 0.1  # PPO clipping
-# PPO_EPOCHS = 3                          # number of policy optimization iterations per batch
+# PPO_EPOCHS = 2                          # number of policy optimization iterations per batch
 # DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # DTYPE = torch.bfloat16
 # COMPILE_MODEL = True
 # USE_FLASH_ATTN = True
 # TEMPERATURE = 0.7
+
+MAX_SEQ_LEN = 2048
+HORIZON = 8                             # reward horizon T (small for debug; paper uses long)
+THOUGHT_MAX_TOKENS = 2048
+G = 16                                  # number of rollouts per context
+GAMMA = 0.7                             # discount factor
+BATCH_SIZE = 16                         # token-level RLP is expensive; tune for your memory
+MINI_BATCH_SIZE = args.mini_batch_size
+LR = 1e-6
+TAU = 0.999                             # EMA decay
+EPS_CLIP_LOW, EPS_CLIP_HIGH = 0.1, 0.1  # PPO clipping
+PPO_EPOCHS = 3                          # number of policy optimization iterations per batch
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DTYPE = torch.bfloat16
+COMPILE_MODEL = True
+USE_FLASH_ATTN = True
+TEMPERATURE = 0.7
 
 DEBUG_LOG_PATH = Path("debug.txt")
 PLOT_SAVE_INTERVAL = 5
@@ -384,43 +384,18 @@ def make_prefix_and_gold_from_full_input(input_ids, t):
     return prefix, gold
 
 @torch.no_grad()
-def compute_returns(rollout_caches, prefix, gold_window, model, s_ema_per_token):
+def compute_returns(s_pred_list, s_ema_per_token, horizon=HORIZON):
     """Compute discounted returns for each rollout individually."""
 
-    device = prefix.device
+    device = s_pred_list[0].device
     s_ema = s_ema_per_token.to(device)
-    gold_len = gold_window.size(1)
-    steps = torch.arange(gold_len, device=device, dtype=s_ema.dtype)
+    steps = torch.arange(horizon, device=device, dtype=s_ema.dtype)
     discounts = torch.pow(torch.tensor(GAMMA, device=device, dtype=s_ema.dtype), steps)
 
-    appended_tokens = torch.cat([end_think.to(device), gold_window], dim=1)
-    gold_window = gold_window.to(device)
-
     returns = []
-    # prefix_len = prefix.size(1)
 
-    # prefix_str = tokenizer.decode(prefix.squeeze(0).tolist())
-    # gold_str = tokenizer.decode(gold_window.squeeze(0).tolist())
-
-    for cache_trimmed in rollout_caches:
-
-        # log_sampled_thought(global_step, None, i, ct.unsqueeze(0), prefix_str, gold_str)
-        # log_sampled_thought(global_step, None, i, torch.cat([ct[:, :ct_len], end_thought_id], dim=1), prefix_str, gold_str)
-
-        context_len = cache_trimmed.get_seq_length()
-
-        attn_mask = torch.ones(1, context_len + appended_tokens.size(1), dtype=torch.long, device=device)
-
-        outputs = model(
-            input_ids=appended_tokens,
-            attention_mask=attn_mask,
-            past_key_values=cache_trimmed,
-            use_cache=True,
-        )
-
-        logits_gold = outputs.logits[:, :-1, :]
-        s_pred = gather_token_logprobs_from_logits(logits_gold, gold_window)
-        r_per_token = s_pred.squeeze(0) - s_ema
+    for s_pred in s_pred_list:
+        r_per_token = s_pred - s_ema
         R = torch.sum(r_per_token * discounts)
         returns.append(R)
 
@@ -453,7 +428,7 @@ def compute_surrogate_loss(logp_new, logp_old, advantage, mask_cot, lengths_tens
     return - row_means.mean()
 
 @torch.no_grad()
-def rollout(model, prefix, num_rollouts=G, temperature=TEMPERATURE, max_new_tokens=THOUGHT_MAX_TOKENS, prefix_cache=None):
+def rollout(model, prefix, gold_window, num_rollouts=G, temperature=TEMPERATURE, max_new_tokens=THOUGHT_MAX_TOKENS, prefix_cache=None):
     """
     Optimized rollout generation:
       - Computes prefix cache once
@@ -491,8 +466,8 @@ def rollout(model, prefix, num_rollouts=G, temperature=TEMPERATURE, max_new_toke
     eos_reached = torch.zeros(num_rollouts, dtype=torch.bool, device=prefix.device)
 
     rollouts_ct = torch.zeros((num_rollouts, max_new_tokens), dtype=torch.long, device=prefix.device)
-    per_token_logp = torch.zeros((num_rollouts, max_new_tokens), dtype=torch.bfloat16, device=prefix.device)
-    per_token_end_think_logp = torch.zeros((num_rollouts, max_new_tokens), dtype=torch.bfloat16, device=prefix.device)
+    per_token_logp = torch.zeros((num_rollouts, max_new_tokens), dtype=torch.float32, device=prefix.device)
+    per_token_end_think_logp = torch.zeros((num_rollouts, max_new_tokens), dtype=torch.float32, device=prefix.device)
 
     # Prealloc temp tensors to avoid reallocations
     token_buffer = torch.empty(num_rollouts, 1, dtype=torch.long, device=prefix.device)
@@ -538,6 +513,7 @@ def rollout(model, prefix, num_rollouts=G, temperature=TEMPERATURE, max_new_toke
     rollouts_ct_list = []
     per_token_logp_list = []
     rollout_caches_list = []
+    s_pred_list = []
     prefix_len = prefix.size(1)
 
     for i in range(num_rollouts):
@@ -545,47 +521,59 @@ def rollout(model, prefix, num_rollouts=G, temperature=TEMPERATURE, max_new_toke
         logps = per_token_logp[i, :step]
 
         eos_positions = ((tokens == eos_token_id) | (tokens == end_think_id)).nonzero(as_tuple=False)
-        if eos_positions.numel() > 0:
-            cutoff = eos_positions[0].item() + 1  # include eos token
+        is_terminated = eos_positions.numel() > 0
+        
+        if is_terminated:
+            cutoff = eos_positions[0].item() # exclude eos or /think
             tokens = tokens[:cutoff].clone()
             logps = logps[:cutoff].clone()
-            if tokens[-1] != end_think_id:
-                tokens[-1] = end_think_id
-                logps[-1] = per_token_end_think_logp[i, cutoff-1]
+            # Get logprob of the /think token at termination
+            end_think_logp = per_token_end_think_logp[i, cutoff]
         else:
             cutoff = step
             tokens = tokens.clone()
             logps = logps.clone()
-        cache_len = prefix_len + step
+        cache_len = prefix_len + cutoff
+        
         cache_i = select_cache_for_batch(past_key_values, i, cache_len)
+
+        # Predict gold tokens
+        # We feed [</think>, gold_window] to the model
+        appended_tokens = torch.cat([end_think, gold_window], dim=1)
+        attn_mask = torch.ones(1, cache_len + appended_tokens.size(1), dtype=torch.long, device=model.device)
+
+        outputs = model(
+            input_ids=appended_tokens,
+            attention_mask=attn_mask,
+            past_key_values=cache_i,
+            use_cache=True,
+        )
+
+        logits_gold = outputs.logits[:, :-1, :]
+        # Compute logprobs for reward (temp=1.0 to match s_ema)
+        s_pred = gather_token_logprobs_from_logits(logits_gold, gold_window) # (1, H)
+        
+        cache_i = outputs.past_key_values
+        
+        # Update PPO training data
+        if is_terminated:
+            # Append </think>
+            # tokens: [thought, </think>]
+            # logps:  [thought_lp, </think>_lp]
+            tokens = torch.cat([tokens, end_think.squeeze(0)], dim=0)
+            logps = torch.cat([logps, end_think_logp.unsqueeze(0)], dim=0)
+        else:
+            # Unterminated: don't train on </think>
+            # tokens: [thought]
+            # logps:  [thought_lp]
+            pass
 
         rollouts_ct_list.append(tokens.unsqueeze(0))
         per_token_logp_list.append(logps)
         rollout_caches_list.append(cache_i)
-    
-    # for cache_trimmed in rollout_caches:
+        s_pred_list.append(s_pred.squeeze(0))
 
-    #     # log_sampled_thought(global_step, None, i, ct.unsqueeze(0), prefix_str, gold_str)
-    #     # log_sampled_thought(global_step, None, i, torch.cat([ct[:, :ct_len], end_thought_id], dim=1), prefix_str, gold_str)
-
-    #     context_len = cache_trimmed.key_cache[0].size(-2)
-
-    #     attn_mask = torch.ones(1, context_len + appended_tokens.size(1), dtype=torch.long, device=device)
-
-    #     outputs = model(
-    #         input_ids=appended_tokens,
-    #         attention_mask=attn_mask,
-    #         past_key_values=cache_trimmed,
-    #         use_cache=True,
-    #     )
-
-    #     logits_gold = outputs.logits[:, :-1, :]
-    #     s_pred = gather_token_logprobs_from_logits(logits_gold, gold_window)
-    #     r_per_token = s_pred.squeeze(0) - s_ema
-    #     R = torch.sum(r_per_token * discounts)
-    #     returns.append(R)
-
-    return rollouts_ct_list, per_token_logp_list, rollout_caches_list
+    return rollouts_ct_list, per_token_logp_list, rollout_caches_list, s_pred_list
 
 
 def slice_cache_to_length(full_cache, length: int) -> DynamicCache:
@@ -773,17 +761,18 @@ for item in progress:
         ema_end = ema_start + HORIZON
         s_ema_per_token = ema_token_logprobs_full[ema_start:ema_end]
 
-        reasoning_prefix = torch.cat([prefix, start_think], dim=1)  # (1, P)
+        reasoning_prefix = torch.cat([prefix, start_think], dim=1)  # (1, P+1)
         cache_for_prefix = prefix_cache_map.get(t)
-        rollouts_ct, per_rollout_thought_logprobs_old, rollout_caches = rollout(
+        rollouts_ct, per_rollout_thought_logprobs_old, rollout_caches, s_pred_list = rollout(
             model,
             reasoning_prefix,
+            gold_window,
             num_rollouts=G,
             prefix_cache=cache_for_prefix,
         )
 
         # Now for each rollout evaluate the reasoned per-token log-probs under the current model (p_theta)
-        returns = compute_returns(rollout_caches, reasoning_prefix, gold_window, , models_ema_per_token)
+        returns = compute_returns(s_pred_list, s_ema_per_token)  # shape (G,)
 
         # Drop rollout caches to avoid holding GPU references beyond this point
         del rollout_caches

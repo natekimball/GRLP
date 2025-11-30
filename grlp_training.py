@@ -271,10 +271,6 @@ def _save_model_checkpoint(
     generation_config,
     tokenizer,
 ) -> None:
-    state_dict = model.state_dict()
-    for key, value in state_dict.items():
-        state_dict[key] = value.detach().to("cpu", copy=True)
-
     save_dir.mkdir(parents=True, exist_ok=True)
     torch.save(state_dict, save_dir / "pytorch_model.bin")
     config.save_pretrained(save_dir)

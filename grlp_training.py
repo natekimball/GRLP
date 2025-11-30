@@ -550,6 +550,7 @@ def rollout(model, prefix, gold_window, num_rollouts=G, temperature=TEMPERATURE,
         )
 
         logits_gold = outputs.logits[:, :-1, :]
+        # logp_gold = gather_token_logprobs_from_logits(logits_gold / temperature, gold_window)  # (1, H)
         # Compute logprobs for reward (temp=1.0 to match s_ema)
         s_pred = gather_token_logprobs_from_logits(logits_gold, gold_window) # (1, H)
         
@@ -652,6 +653,45 @@ def collect_prefix_caches(model, input_ids, positions):
     return caches
 
 
+def initialize_think_embeddings(model, tokenizer, embeddings_path="think_embeddings.pt"):
+    if not os.path.exists(embeddings_path):
+        print(f"Warning: Embeddings file '{embeddings_path}' not found. Skipping initialization.")
+        return
+
+    print(f"Loading think embeddings from {embeddings_path}...")
+    embeddings_data = torch.load(embeddings_path, map_location="cpu")
+    
+    input_embeddings = model.get_input_embeddings()
+    weight = input_embeddings.weight
+    
+    for token_str, embedding_tensor in embeddings_data.items():
+        # Try to find the token ID
+        ids = tokenizer.encode(token_str, add_special_tokens=False)
+        if len(ids) == 1:
+            token_id = ids[0]
+        else:
+            # Fallback: check if it's a known special token
+            token_id = tokenizer.convert_tokens_to_ids(token_str)
+            if token_id == tokenizer.unk_token_id and token_str != tokenizer.unk_token:
+                 print(f"Warning: Token '{token_str}' not found in tokenizer. Skipping.")
+                 continue
+
+        if token_id >= weight.shape[0]:
+            # This might happen if tokenizer has more tokens than model embeddings
+            print(f"Resizing token embeddings to accommodate token ID {token_id}...")
+            model.resize_token_embeddings(len(tokenizer))
+            input_embeddings = model.get_input_embeddings()
+            weight = input_embeddings.weight
+            
+        with torch.no_grad():
+            if embedding_tensor.shape[-1] != weight.shape[-1]:
+                print(f"Error: Dimension mismatch for '{token_str}'. File: {embedding_tensor.shape[-1]}, Model: {weight.shape[-1]}")
+                continue
+                
+            weight[token_id].copy_(embedding_tensor.to(weight.device).to(weight.dtype))
+            print(f"Initialized embedding for '{token_str}' (ID: {token_id})")
+
+
 # -----------------------------
 # Load model, tokenizer, dataset
 # -----------------------------
@@ -683,6 +723,8 @@ attn_implementation = "flash_attention_2" if USE_FLASH_ATTN else "eager"
 model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, attn_implementation=attn_implementation, trust_remote_code=True, dtype=DTYPE).to(DEVICE)
 model.config.use_flash_attention = USE_FLASH_ATTN
 model.gradient_checkpointing_enable()
+
+initialize_think_embeddings(model, tokenizer)
 
 ema_model = copy.deepcopy(model).to(DEVICE)
 for p in ema_model.parameters():

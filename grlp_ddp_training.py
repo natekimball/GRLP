@@ -347,8 +347,8 @@ def gather_token_logprobs_from_logits(logits, target_ids):
     # Use cross_entropy for memory efficiency (avoids materializing full log_softmax)
     # F.cross_entropy returns negative log likelihood, so we negate it.
     return -F.cross_entropy(
-        logits.view(-1, logits.size(-1)), 
-        target_ids.view(-1), 
+        logits.reshape(-1, logits.size(-1)), 
+        target_ids.reshape(-1), 
         reduction='none'
     ).view(target_ids.size())
 

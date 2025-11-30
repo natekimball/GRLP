@@ -526,11 +526,10 @@ def rollout(model, prefix, gold_window, num_rollouts=G, temperature=TEMPERATURE,
             break
     
 
-    # 5️⃣ Post-process: split per-rollout
+    # 5️⃣ Post-process: split per-rollout and prepare for batched s_pred
     rollouts_ct_list = []
     per_token_logp_list = []
-    rollout_caches_list = []
-    s_pred_list = []
+    cutoffs = []
     prefix_len = prefix.size(1)
 
     for i in range(num_rollouts):
@@ -542,56 +541,84 @@ def rollout(model, prefix, gold_window, num_rollouts=G, temperature=TEMPERATURE,
         
         if is_terminated:
             cutoff = eos_positions[0].item() # exclude eos or /think
-            tokens = tokens[:cutoff].clone()
-            logps = logps[:cutoff].clone()
+            tokens_ret = tokens[:cutoff].clone()
+            logps_ret = logps[:cutoff].clone()
             # Get logprob of the /think token at termination
             end_think_logp = per_token_end_think_logp[i, cutoff]
+            
+            # Append </think>
+            tokens_ret = torch.cat([tokens_ret, end_think.squeeze(0)], dim=0)
+            logps_ret = torch.cat([logps_ret, end_think_logp.unsqueeze(0)], dim=0)
+            
+            cutoffs.append(cutoff)
         else:
             cutoff = step
-            tokens = tokens.clone()
-            logps = logps.clone()
-        cache_len = prefix_len + cutoff
-        
-        cache_i = select_cache_for_batch(past_key_values, i, cache_len)
+            tokens_ret = tokens.clone()
+            logps_ret = logps.clone()
+            cutoffs.append(cutoff)
 
-        # Predict gold tokens
-        # We feed [</think>, gold_window] to the model
-        appended_tokens = torch.cat([end_think, gold_window], dim=1)
-        attn_mask = torch.ones(1, cache_len + appended_tokens.size(1), dtype=torch.long, device=appended_tokens.device)
+        rollouts_ct_list.append(tokens_ret.unsqueeze(0))
+        per_token_logp_list.append(logps_ret)
 
-        outputs = model(
-            input_ids=appended_tokens,
-            attention_mask=attn_mask,
-            past_key_values=cache_i,
-            use_cache=True,
-        )
+    # 6️⃣ Batched s_pred computation
+    # We want to compute logprobs of gold_window given prefix + thought + </think>
+    # We reuse the past_key_values from generation, masking out the "future" garbage for shorter rollouts.
+    
+    # Determine cache length from the model output
+    # past_key_values is a DynamicCache or tuple.
+    if isinstance(past_key_values, DynamicCache):
+        cache_len = past_key_values.get_seq_length()
+    else:
+        cache_len = past_key_values[0][0].size(2)
 
-        logits_gold = outputs.logits[:, :-1, :]
-        # logp_gold = gather_token_logprobs_from_logits(logits_gold / temperature, gold_window)  # (1, H)
-        # Compute logprobs for reward (temp=1.0 to match s_ema)
-        s_pred = gather_token_logprobs_from_logits(logits_gold, gold_window) # (1, H)
-        
-        cache_i = outputs.past_key_values
-        
-        # Update PPO training data
-        if is_terminated:
-            # Append </think>
-            # tokens: [thought, </think>]
-            # logps:  [thought_lp, </think>_lp]
-            tokens = torch.cat([tokens, end_think.squeeze(0)], dim=0)
-            logps = torch.cat([logps, end_think_logp.unsqueeze(0)], dim=0)
-        else:
-            # Unterminated: don't train on </think>
-            # tokens: [thought]
-            # logps:  [thought_lp]
-            pass
+    H = gold_window.size(1)
+    # Input: [</think>, gold_window]
+    input_ids = torch.cat([end_think, gold_window], dim=1).expand(num_rollouts, -1) # (G, 1+H)
+    
+    # Position IDs: start after the valid thought
+    cutoffs_tensor = torch.tensor(cutoffs, device=prefix.device, dtype=torch.long)
+    starts = prefix_len + cutoffs_tensor # (G,)
+    offsets = torch.arange(1 + H, device=prefix.device, dtype=torch.long).unsqueeze(0) # (1, 1+H)
+    position_ids = starts.unsqueeze(1) + offsets # (G, 1+H)
+    
+    # Attention Mask
+    # We need to mask out the garbage in the cache (indices > prefix_len + cutoff)
+    # cache_mask: 1 if valid, 0 if garbage
+    cache_range = torch.arange(cache_len, device=prefix.device).unsqueeze(0) # (1, cache_len)
+    valid_len = (prefix_len + cutoffs_tensor).unsqueeze(1) # (G, 1)
+    cache_mask = cache_range < valid_len # (G, cache_len)
+    
+    # New tokens are always valid
+    new_mask = torch.ones((num_rollouts, 1 + H), dtype=torch.bool, device=prefix.device)
+    attention_mask = torch.cat([cache_mask, new_mask], dim=1).long() # (G, cache_len + 1 + H)
+    
+    outputs = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        past_key_values=past_key_values,
+        use_cache=True
+    )
+    
+    logits = outputs.logits # (G, 1+H, V)
+    # We want logprobs for gold_window.
+    # The logits at index 0 (corresponding to </think>) predict gold_0.
+    # The logits at index H-1 (corresponding to gold_{H-1}) predict gold_H (which we don't have/need).
+    # Wait, we want P(gold | context).
+    # Input: [</think>, gold_0, ... gold_{H-1}]
+    # Logits at [0] -> predict gold_0
+    # Logits at [1] -> predict gold_1
+    # ...
+    # Logits at [H-1] -> predict gold_{H-1}
+    # So we need logits[:, :-1, :]
+    
+    logits_gold = logits[:, :-1, :] # (G, H, V)
+    targets = gold_window.expand(num_rollouts, -1) # (G, H)
+    
+    s_pred_batch = gather_token_logprobs_from_logits(logits_gold, targets) # (G, H)
+    s_pred_list = list(s_pred_batch.unbind(0))
 
-        rollouts_ct_list.append(tokens.unsqueeze(0))
-        per_token_logp_list.append(logps)
-        rollout_caches_list.append(cache_i)
-        s_pred_list.append(s_pred.squeeze(0))
-
-    return rollouts_ct_list, per_token_logp_list, rollout_caches_list, s_pred_list
+    return rollouts_ct_list, per_token_logp_list, s_pred_list
 
 
 def slice_cache_to_length(full_cache, length: int) -> DynamicCache:
@@ -833,7 +860,7 @@ for item in progress:
 
         reasoning_prefix = torch.cat([prefix, start_think], dim=1)  # (1, P+1)
         cache_for_prefix = prefix_cache_map.get(t)
-        rollouts_ct, per_rollout_thought_logprobs_old, rollout_caches, s_pred_list = rollout(
+        rollouts_ct, per_rollout_thought_logprobs_old, s_pred_list = rollout(
             inference_model,
             reasoning_prefix,
             gold_window,
@@ -845,7 +872,6 @@ for item in progress:
         returns = compute_returns(s_pred_list, s_ema_per_token)  # shape (G,)
 
         # Drop rollout caches to avoid holding GPU references beyond this point
-        del rollout_caches
         del s_ema_per_token
 
         # Move rollout artifacts to pinned CPU buffers to free VRAM until PPO phase
